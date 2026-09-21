@@ -92,6 +92,11 @@ types as being acceptable for a validator object, then you should update an
 existing `jsonschema.TypeChecker` or create a new one. You may then create a new
 `Validator` via `jsonschema.validators.extend`.
 
+Use `jsonschema.TypeChecker.redefine` to change the behavior of an existing
+JSON Schema type, and `jsonschema.TypeChecker.with_checker` to add a new type.
+Both methods reject invalid arguments immediately and return a new immutable
+checker, leaving the original checker unchanged.
+
 .. testcode::
 
     from jsonschema import validators

@@ -20,7 +20,13 @@ if TYPE_CHECKING:
 def _typed_map_converter(
     init_val: Mapping[str, Callable[[TypeChecker, Any], bool]],
 ) -> HashTrieMap[str, Callable[[TypeChecker, Any], bool]]:
-    return HashTrieMap.convert(init_val)
+    type_checkers = HashTrieMap.convert(init_val)
+    for type, checker in type_checkers.items():
+        if not callable(checker):
+            raise TypeError(
+                f"Type checker for {type!r} is not callable: {checker!r}",
+            )
+    return type_checkers
 
 
 def is_array(checker, instance):
@@ -139,6 +145,33 @@ class TypeChecker:
         """
         return self.redefine_many({type: fn})
 
+    def with_checker(self, type: str, fn) -> TypeChecker:
+        """
+        Produce a new checker with an additional type.
+
+        Arguments:
+
+            type:
+
+                The name of the additional type to check.
+
+            fn (collections.abc.Callable):
+
+                A callable taking exactly two parameters - the type
+                checker calling the function and the instance to check.
+                The function should return true if instance is of this
+                type and false otherwise.
+
+        """
+        if not callable(fn):
+            raise TypeError(
+                f"Type checker for {type!r} is not callable: {fn!r}",
+            )
+        return evolve(
+            self,
+            type_checkers=self._type_checkers.insert(type, fn),
+        )
+
     def redefine_many(self, definitions=()) -> TypeChecker:
         """
         Produce a new checker with the given types redefined.
@@ -149,7 +182,18 @@ class TypeChecker:
 
                 A dictionary mapping types to their checking functions.
 
+        Only types already known to this checker may be redefined. To add
+        support for an additional type, use ``with_checker`` or construct
+        a new ``TypeChecker``.
+
         """
+        for type, fn in definitions.items():
+            if type not in self._type_checkers:
+                raise UndefinedTypeCheck(type)
+            if not callable(fn):
+                raise TypeError(
+                    f"Type checker for {type!r} is not callable: {fn!r}",
+                )
         type_checkers = self._type_checkers.update(definitions)
         return evolve(self, type_checkers=type_checkers)
 

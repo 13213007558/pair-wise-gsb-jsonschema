@@ -90,6 +90,10 @@ class _Error(Exception):
         self.parent = parent
         self._type_checker = type_checker
 
+        if type_checker is not _unset:
+            for error in context:
+                error._set(type_checker=type_checker)
+
         for error in context:
             error.parent = self
 
@@ -127,7 +131,7 @@ class _Error(Exception):
 
     @classmethod
     def create_from(cls, other: _Error):
-        return cls(**other._contents())
+        return cls(**other._contents(), type_checker=other._type_checker)
 
     @property
     def absolute_path(self) -> Sequence[str | int]:
@@ -169,6 +173,8 @@ class _Error(Exception):
     ) -> None:
         if type_checker is not None and self._type_checker is _unset:
             self._type_checker = type_checker
+            for error in self.context:
+                error._set(type_checker=type_checker)
 
         for k, v in kwargs.items():
             if getattr(self, k) is _unset:

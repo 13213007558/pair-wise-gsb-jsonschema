@@ -212,6 +212,7 @@ def create(
         a new `jsonschema.protocols.Validator` class
 
     """
+    type_checker_arg = type_checker
     # preemptively don't shadow the `Validator.format_checker` local
     format_checker_arg = format_checker
 
@@ -225,12 +226,19 @@ def create(
 
         VALIDATORS = dict(validators)  # noqa: RUF012
         META_SCHEMA = dict(meta_schema)  # noqa: RUF012
-        TYPE_CHECKER = type_checker
+        TYPE_CHECKER = type_checker_arg
         FORMAT_CHECKER = format_checker_arg
         ID_OF = staticmethod(id_of)
 
         _APPLICABLE_VALIDATORS = applicable_validators
         _validators = field(init=False, repr=False, eq=False)
+        _type_checker = field(
+            default=None,
+            alias="_type_checker",
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
 
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
         _ref_resolver = field(default=None, repr=False, alias="resolver")
@@ -281,6 +289,9 @@ def create(
             cls.evolve = evolve
 
         def __attrs_post_init__(self):
+            if self._type_checker is None:
+                self._type_checker = type_checker_arg
+
             if self._resolver is None:
                 registry = self._registry
                 if registry is not _REMOTE_WARNING_REGISTRY:
@@ -337,9 +348,14 @@ def create(
                 )
             return self._ref_resolver
 
+        @property
+        def type_checker(self):
+            return self._type_checker
+
         def evolve(self, **changes):
             schema = changes.setdefault("schema", self.schema)
             NewValidator = validator_for(schema, default=self.__class__)
+            changes.setdefault("_type_checker", self._type_checker)
 
             for (attr_name, init_name) in evolve_fields:
                 if init_name not in changes:
@@ -388,7 +404,7 @@ def create(
                         validator_value=v,
                         instance=instance,
                         schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
+                        type_checker=self.type_checker,
                     )
                     if k not in {"if", "$ref"}:
                         error.schema_path.appendleft(k)
@@ -436,7 +452,7 @@ def create(
                         validator_value=v,
                         instance=instance,
                         schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
+                        type_checker=evolved.type_checker,
                     )
                     if k not in {"if", "$ref"}:
                         error.schema_path.appendleft(k)
@@ -452,7 +468,7 @@ def create(
 
         def is_type(self, instance, type):
             try:
-                return self.TYPE_CHECKER.is_type(instance, type)
+                return self.type_checker.is_type(instance, type)
             except exceptions.UndefinedTypeCheck:
                 exc = exceptions.UnknownType(type, instance, self.schema)
                 raise exc from None

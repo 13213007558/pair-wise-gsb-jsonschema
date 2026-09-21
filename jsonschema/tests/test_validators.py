@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections import deque, namedtuple
 from contextlib import contextmanager
+import copy
 from decimal import Decimal
 from io import BytesIO
+import numbers
+import pickle
+from threading import Barrier, Thread
 from typing import Any
 from unittest import TestCase, mock
 from urllib.request import pathname2url
@@ -1783,7 +1788,7 @@ class ValidatorTestMixin(MetaSchemaTestsMixin):
         schema = {"type": [non_string_type]}
         Crazy = validators.extend(
             self.Validator,
-            type_checker=self.Validator.TYPE_CHECKER.redefine(
+            type_checker=self.Validator.TYPE_CHECKER.with_checker(
                 non_string_type,
                 lambda checker, thing: isinstance(thing, int),
             ),
@@ -2006,6 +2011,268 @@ class TestLatestValidator(TestCase):
 
         with self.assertRaises(exceptions.ValidationError):
             validator.validate(None)
+
+
+class CustomMapping(Mapping):
+    def __init__(self, *args, **kwargs):
+        self._data = dict(*args, **kwargs)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+
+class NumPyLikeInteger:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        return self.value
+
+    def __int__(self):
+        return self.value
+
+
+def is_custom_number(checker, instance):
+    return (
+        validators.Draft202012Validator.TYPE_CHECKER.is_type(
+            instance, "number",
+        )
+        or isinstance(instance, Decimal)
+    )
+
+
+def is_picklable_integer(checker, instance):
+    return isinstance(instance, int) and not isinstance(instance, bool)
+
+
+class TestTypeCheckerSnapshots(TestCase):
+    type_name = "custom-number"
+
+    def setUp(self):
+        default = validators.Draft202012Validator.TYPE_CHECKER
+        self.number_checker = default.with_checker(
+            self.type_name,
+            is_custom_number,
+        )
+        self.number_validator = validators.extend(
+            validators.Draft202012Validator,
+            type_checker=self.number_checker,
+        )
+        self.integer_checker = default.redefine(
+            "integer",
+            lambda checker, instance: isinstance(
+                instance, (int, numbers.Integral, NumPyLikeInteger),
+            ) and not isinstance(instance, bool),
+        )
+        self.integer_validator = validators.extend(
+            validators.Draft202012Validator,
+            type_checker=self.integer_checker,
+        )
+        self.object_checker = default.redefine(
+            "object",
+            lambda checker, instance: isinstance(instance, Mapping),
+        )
+        self.object_validator = validators.extend(
+            validators.Draft202012Validator,
+            type_checker=self.object_checker,
+        )
+
+    def assert_errors_use_checker(self, errors, checker):
+        errors = list(errors)
+        for error in errors:
+            self.assertIs(error._type_checker, checker)
+            self.assert_errors_use_checker(error.context, checker)
+
+    def test_nested_anyof_and_format(self):
+        format_checker = FormatChecker()
+
+        @format_checker.checks(self.type_name)
+        def checks_number(instance):
+            return isinstance(instance, (int, float, Decimal))
+
+        schema = {
+            "anyOf": [{"allOf": [{"type": self.type_name}]}],
+            "format": self.type_name,
+        }
+        validator = self.number_validator(
+            schema, format_checker=format_checker,
+        )
+
+        self.assertTrue(validator.is_valid(Decimal("1")))
+        errors = list(validator.iter_errors("not a number"))
+        self.assert_errors_use_checker(errors, self.number_checker)
+
+    def test_ref_registry_and_numpy_like_integer(self):
+        referenced = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [{"type": "integer"}],
+        }
+        registry = referencing.Registry().with_resource(
+            "https://example.com/integer",
+            referencing.Resource.from_contents(
+                referenced,
+                default_specification=referencing.jsonschema.DRAFT202012,
+            ),
+        )
+        validator = self.integer_validator(
+            {"$ref": "https://example.com/integer"},
+            registry=registry,
+        )
+
+        self.assertTrue(validator.is_valid(NumPyLikeInteger(3)))
+        self.assertFalse(validator.is_valid("not an integer"))
+        self.assert_errors_use_checker(
+            validator.iter_errors("not an integer"),
+            self.integer_checker,
+        )
+
+    def test_recursive_ref_preserves_checker(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2019-09/schema",
+            "$id": "https://example.com/recursive.json",
+            "$recursiveAnchor": True,
+            "$defs": {
+                "node": {
+                    "$id": "node.json",
+                    "$recursiveAnchor": True,
+                    "anyOf": [
+                        {"type": "integer"},
+                        {
+                            "type": "object",
+                            "additionalProperties": {
+                                "$recursiveRef": "#",
+                            },
+                        },
+                    ],
+                },
+            },
+            "$ref": "#/$defs/node",
+        }
+        custom = validators.extend(
+            validators.Draft201909Validator,
+            type_checker=self.integer_checker,
+        )
+        validator = custom(schema)
+
+        self.assertTrue(
+            validator.is_valid({"child": NumPyLikeInteger(3)}),
+        )
+        errors = list(
+            validator.iter_errors({"child": "not an integer"}),
+        )
+        self.assert_errors_use_checker(errors, self.integer_checker)
+
+    def test_legacy_ref_resolver_preserves_checker(self):
+        referenced = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "integer",
+        }
+        resolver = validators._RefResolver(
+            "",
+            {},
+            store={"integer": referenced},
+        )
+        validator = self.integer_validator(
+            {"$ref": "integer"},
+            resolver=resolver,
+        )
+
+        self.assertTrue(validator.is_valid(NumPyLikeInteger(3)))
+        self.assertFalse(validator.is_valid("not an integer"))
+
+    def test_mapping_error_paths(self):
+        checker = self.object_checker.with_checker(
+            self.type_name,
+            self.number_checker._type_checkers[self.type_name],
+        )
+        validator = validators.extend(
+            self.object_validator, type_checker=checker,
+        )
+        schema = {
+            "properties": {
+                "child": {"anyOf": [{"type": self.type_name}]},
+            },
+        }
+        instance = CustomMapping(child=Decimal("1"))
+
+        self.assertTrue(validator({"type": "object"}).is_valid(instance))
+        self.assertTrue(validator(schema).is_valid(instance))
+
+        errors = list(
+            validator(schema).iter_errors(CustomMapping(child="bad")),
+        )
+        self.assertEqual(list(errors[0].absolute_path), ["child"])
+        self.assert_errors_use_checker(errors, checker)
+
+    def test_copy_and_pickle_preserve_checker(self):
+        validator = self.number_validator(
+            {"anyOf": [{"type": self.type_name}]},
+        )
+        shallow = copy.copy(validator)
+        self.assertIs(shallow.type_checker, self.number_checker)
+        deep = copy.deepcopy(validator)
+        self.assertEqual(deep.type_checker, self.number_checker)
+        for copied in (shallow, deep):
+            self.assertTrue(copied.is_valid(Decimal("1")))
+        picklable_checker = TypeChecker(
+            {"integer": is_picklable_integer},
+        )
+        reloaded_checker = pickle.loads(pickle.dumps(picklable_checker))
+        self.assertEqual(reloaded_checker, picklable_checker)
+        self.assertTrue(reloaded_checker.is_type(1, "integer"))
+
+    def test_remove_and_extend_are_separate_snapshots(self):
+        removed = self.number_checker.remove(self.type_name)
+        removed_validator = validators.extend(
+            self.number_validator, type_checker=removed,
+        )
+
+        self.assertIsNot(removed, self.number_checker)
+        self.assertIs(
+            self.number_validator.TYPE_CHECKER,
+            self.number_checker,
+        )
+        self.assertTrue(
+            self.number_validator({"type": self.type_name}).is_valid(
+                Decimal("1"),
+            ),
+        )
+        with self.assertRaises(exceptions.UnknownType):
+            removed_validator({"type": self.type_name}).is_valid(
+                Decimal("1"),
+            )
+
+    def test_concurrent_redefinitions_are_isolated(self):
+        barrier = Barrier(2)
+        failures = []
+
+        def validate(validator, instance):
+            barrier.wait()
+            try:
+                if not validator.is_valid(instance):
+                    failures.append(instance)
+            except Exception as error:  # pragma: no cover
+                failures.append(error)
+
+        custom = self.integer_validator({"type": "integer"})
+        standard = validators.Draft202012Validator({"type": "integer"})
+        threads = [
+            Thread(target=validate, args=(custom, NumPyLikeInteger(1))),
+            Thread(target=validate, args=(standard, NumPyLikeInteger(1))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].value, 1)
 
 
 class TestValidatorFor(TestCase):

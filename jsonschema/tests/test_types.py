@@ -22,6 +22,10 @@ def is_namedtuple(instance):
     return isinstance(instance, tuple) and getattr(instance, "_fields", None)
 
 
+def is_anything(checker, instance):
+    return True
+
+
 def is_object_or_named_tuple(checker, instance):
     if Draft202012Validator.TYPE_CHECKER.is_type(instance, "object"):
         return True
@@ -53,13 +57,33 @@ class TestTypeChecker(TestCase):
 
     def test_checks_can_be_added_at_init(self):
         checker = TypeChecker({"two": equals_2})
-        self.assertEqual(checker, TypeChecker().redefine("two", equals_2))
+        self.assertEqual(checker, TypeChecker().with_checker("two", equals_2))
+
+    def test_with_checker_returns_a_new_checker(self):
+        original = TypeChecker()
+        checker = original.with_checker("two", equals_2)
+
+        self.assertEqual(checker, TypeChecker({"two": equals_2}))
+        self.assertEqual(original, TypeChecker())
 
     def test_redefine_existing_type(self):
         self.assertEqual(
-            TypeChecker().redefine("two", object()).redefine("two", equals_2),
-            TypeChecker().redefine("two", equals_2),
+            TypeChecker({"two": is_anything})
+            .redefine("two", equals_2),
+            TypeChecker({"two": equals_2}),
         )
+
+    def test_redefine_unknown_type(self):
+        with self.assertRaises(UndefinedTypeCheck):
+            TypeChecker().redefine("two", equals_2)
+
+    def test_redefine_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker({"two": equals_2}).redefine("two", object())
+
+    def test_with_checker_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker().with_checker("two", object())
 
     def test_remove(self):
         self.assertEqual(
@@ -74,9 +98,26 @@ class TestTypeChecker(TestCase):
 
     def test_redefine_many(self):
         self.assertEqual(
-            TypeChecker().redefine_many({"foo": int, "bar": str}),
-            TypeChecker().redefine("foo", int).redefine("bar", str),
+            TypeChecker({"foo": is_anything, "bar": is_anything})
+            .redefine_many({"foo": int, "bar": str}),
+            TypeChecker(
+                {"foo": int, "bar": str},
+            ).redefine("bar", str),
         )
+
+    def test_redefine_many_unknown_type(self):
+        with self.assertRaises(UndefinedTypeCheck):
+            TypeChecker({"foo": is_anything}).redefine_many(
+                {"foo": int, "bar": str},
+            )
+
+    def test_redefine_many_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker({"foo": object()}).redefine_many({"foo": int()})
+
+    def test_init_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker({"foo": object()})
 
     def test_remove_multiple(self):
         self.assertEqual(
