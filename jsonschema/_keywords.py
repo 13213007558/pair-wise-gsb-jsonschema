@@ -225,7 +225,17 @@ def format(validator, format, instance, schema):
         try:
             validator.format_checker.check(instance, format)
         except FormatError as error:
-            yield ValidationError(error.message, cause=error.cause)
+            if isinstance(error.cause, ValidationError):
+                yield error.cause
+            else:
+                validation_error = ValidationError(
+                    error.message,
+                    cause=error.cause,
+                )
+                validation_error.__context__ = error.__context__
+                yield validation_error
+        except ValidationError as error:
+            yield error
 
 
 def minLength(validator, mL, instance, schema):

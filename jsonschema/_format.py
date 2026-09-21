@@ -1,24 +1,65 @@
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import date, datetime
+from enum import Enum, auto
 from uuid import UUID
+import copy
 import ipaddress
 import re
+import threading
 import typing
 import warnings
 
-from jsonschema.exceptions import FormatError
+from jsonschema.exceptions import FormatError, ValidationError
 
 _FormatCheckCallable = typing.Callable[[object], bool]
 #: A format checker callable.
 _F = typing.TypeVar("_F", bound=_FormatCheckCallable)
 _RaisesType = typing.Union[type[Exception], tuple[type[Exception], ...]]
 
+
+class ExceptionPolicy(Enum):
+    """What a FormatChecker does with an undeclared checker exception."""
+
+    RAISE = auto()
+    INVALID = auto()
+    IGNORE = auto()
+
+
+_ExceptionPolicy = typing.Union[
+    ExceptionPolicy,
+    typing.Callable[
+        [object, str, Exception],
+        typing.Union[bool, ExceptionPolicy],
+    ],
+]
+
+
+def _default_exception_policy(
+    instance: object,
+    format: str,
+    error: Exception,
+) -> ExceptionPolicy:
+    if isinstance(error, ValidationError):
+        return ExceptionPolicy.INVALID
+    return ExceptionPolicy.RAISE
+
+
+class _FormatCheckerMeta(type):
+    _class_checkers: dict[
+        str,
+        tuple[_FormatCheckCallable, _RaisesType],
+    ]
+
+    @property
+    def checkers(cls) -> dict[str, tuple[_FormatCheckCallable, _RaisesType]]:
+        return cls._class_checkers
+
 _RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 
 
-class FormatChecker:
+class FormatChecker(metaclass=_FormatCheckerMeta):
     """
     A ``format`` property checker.
 
@@ -39,23 +80,159 @@ class FormatChecker:
             The known formats to validate. This argument can be used to
             limit which formats will be used during validation.
 
+        exception_policy:
+
+            Controls exceptions not listed in a checker's raises.
+            Built-in policies are RAISE, INVALID, and IGNORE. A callable
+            receives the instance, format, and exception and returns one.
+
     """
 
-    checkers: dict[
+    _class_checkers: dict[
         str,
         tuple[_FormatCheckCallable, _RaisesType],
     ] = {}  # noqa: RUF012
+    _class_lock = threading.RLock()
+    RAISE = ExceptionPolicy.RAISE
+    INVALID = ExceptionPolicy.INVALID
+    IGNORE = ExceptionPolicy.IGNORE
 
-    def __init__(self, formats: typing.Iterable[str] | None = None):
-        if formats is None:
-            formats = self.checkers.keys()
-        self.checkers = {k: self.checkers[k] for k in formats}
+    def __init__(
+        self,
+        formats: typing.Iterable[str] | None = None,
+        exception_policy: _ExceptionPolicy = _default_exception_policy,
+    ):
+        cls = type(self)
+        with cls._class_lock:
+            class_checkers = dict(cls._class_checkers)
+            selected_formats = (
+                class_checkers.keys() if formats is None else formats
+            )
+            self._checkers = {
+                name: class_checkers[name] for name in selected_formats
+            }
+
+        self.exception_policy = exception_policy
+        self._exception_policies: dict[str, _ExceptionPolicy] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def checkers(self) -> dict[str, tuple[_FormatCheckCallable, _RaisesType]]:
+        """Return a point-in-time copy of the checker registry."""
+        with self._lock:
+            return dict(self._checkers)
+
+    def __copy__(self):
+        with self._lock:
+            checker = type(self)(
+                formats=(),
+                exception_policy=self.exception_policy,
+            )
+            checker._checkers = dict(self._checkers)
+            checker._exception_policies = dict(self._exception_policies)
+            return checker
+
+    def __deepcopy__(self, memo):
+        with self._lock:
+            checker = type(self)(
+                formats=(),
+                exception_policy=copy.deepcopy(self.exception_policy, memo),
+            )
+            checker._checkers = copy.deepcopy(self._checkers, memo)
+            checker._exception_policies = copy.deepcopy(
+                self._exception_policies,
+                memo,
+            )
+            return checker
+
+    def __getstate__(self):
+        with self._lock:
+            return {
+                "checkers": dict(self._checkers),
+                "exception_policy": self.exception_policy,
+                "exception_policies": dict(self._exception_policies),
+            }
+
+    def __setstate__(self, state):
+        self._checkers = dict(state["checkers"])
+        self.exception_policy = state["exception_policy"]
+        self._exception_policies = dict(state["exception_policies"])
+        self._lock = threading.RLock()
 
     def __repr__(self):
         return f"<FormatChecker checkers={sorted(self.checkers)}>"
 
+    def register(
+        self,
+        format: str,
+        func: _FormatCheckCallable,
+        raises: _RaisesType = (),
+        *,
+        exception_policy: _ExceptionPolicy | None = None,
+        overwrite: bool = True,
+    ) -> None:
+        """Register func as the checker for format."""
+        with self._lock:
+            if not overwrite and format in self._checkers:
+                raise ValueError(
+                    f"A checker for {format!r} is already registered",
+                )
+            self._checkers[format] = (func, raises)
+            if exception_policy is None:
+                self._exception_policies.pop(format, None)
+            else:
+                self._exception_policies[format] = exception_policy
+
+    def unregister(self, format: str, *, missing_ok: bool = False) -> None:
+        """Remove the checker registered for format."""
+        with self._lock:
+            try:
+                del self._checkers[format]
+            except KeyError:
+                if not missing_ok:
+                    raise
+            self._exception_policies.pop(format, None)
+
+    @contextmanager
+    def registered(
+        self,
+        format: str,
+        func: _FormatCheckCallable,
+        raises: _RaisesType = (),
+        *,
+        exception_policy: _ExceptionPolicy | None = None,
+    ):
+        """Temporarily register a checker for the duration of a block."""
+        with self._lock:
+            previous_policy = self._exception_policies.get(format)
+            had_previous = format in self._checkers
+            previous = self._checkers.get(format)
+            self._checkers[format] = (func, raises)
+            if exception_policy is None:
+                self._exception_policies.pop(format, None)
+            else:
+                self._exception_policies[format] = exception_policy
+        try:
+            yield
+        finally:
+            with self._lock:
+                if had_previous:
+                    assert previous is not None
+                    self._checkers[format] = previous
+                    if previous_policy is not None:
+                        self._exception_policies[format] = previous_policy
+                    else:
+                        self._exception_policies.pop(format, None)
+                else:
+                    self.unregister(format, missing_ok=True)
+
     def checks(
-        self, format: str, raises: _RaisesType = (),
+        self,
+        format: str,
+        raises: _RaisesType = (),
+        *,
+        exception_policy: _ExceptionPolicy | None = None,
+        overwrite: bool = True,
     ) -> typing.Callable[[_F], _F]:
         """
         Register a decorated function as validating a new format.
@@ -75,10 +252,24 @@ class FormatChecker:
                 `jsonschema.exceptions.ValidationError.cause` attribute of the
                 resulting validation error.
 
+            exception_policy:
+
+                An optional policy specific to this format.
+
+            overwrite:
+
+                Whether an existing checker for this format is replaced.
+
         """
 
         def _checks(func: _F) -> _F:
-            self.checkers[format] = (func, raises)
+            self.register(
+                format,
+                func,
+                raises,
+                exception_policy=exception_policy,
+                overwrite=overwrite,
+            )
             return func
 
         return _checks
@@ -100,13 +291,57 @@ class FormatChecker:
 
     @classmethod
     def _cls_checks(
-        cls, format: str, raises: _RaisesType = (),
+        cls,
+        format: str,
+        raises: _RaisesType = (),
     ) -> typing.Callable[[_F], _F]:
         def _checks(func: _F) -> _F:
-            cls.checkers[format] = (func, raises)
+            with cls._class_lock:
+                cls._class_checkers[format] = (func, raises)
             return func
 
         return _checks
+
+    def _snapshot(
+        self,
+    ) -> tuple[
+        dict[str, tuple[_FormatCheckCallable, _RaisesType]],
+        dict[str, _ExceptionPolicy],
+        _ExceptionPolicy,
+    ]:
+        with self._lock:
+            return (
+                dict(self._checkers),
+                dict(self._exception_policies),
+                self.exception_policy,
+            )
+
+    def _handle_exception(
+        self,
+        error: Exception,
+        instance: object,
+        format: str,
+        policy: _ExceptionPolicy,
+    ) -> None:
+        if callable(policy):
+            outcome = policy(instance, format, error)
+            if outcome is True:
+                outcome = ExceptionPolicy.IGNORE
+            elif outcome is False:
+                outcome = ExceptionPolicy.INVALID
+        else:
+            outcome = policy
+
+        if outcome is ExceptionPolicy.RAISE:
+            raise error
+        if outcome is ExceptionPolicy.IGNORE:
+            return
+        if isinstance(error, ValidationError):
+            raise error
+        raise FormatError(
+            f"{instance!r} is not a {format!r}",
+            cause=error,
+        ) from error
 
     def check(self, instance: object, format: str) -> None:
         """
@@ -129,17 +364,32 @@ class FormatChecker:
                 if the instance does not conform to ``format``
 
         """
-        if format not in self.checkers:
+        checkers, policies, default_policy = self._snapshot()
+        entry = checkers.get(format)
+        if entry is None:
             return
 
-        func, raises = self.checkers[format]
+        func, raises = entry
         result, cause = None, None
         try:
             result = func(instance)
         except raises as e:
             cause = e
+        except Exception as e:
+            self._handle_exception(
+                e,
+                instance,
+                format,
+                policies.get(format, default_policy),
+            )
+            return
         if not result:
-            raise FormatError(f"{instance!r} is not a {format!r}", cause=cause)
+            error = FormatError(
+                f"{instance!r} is not a {format!r}",
+                cause=cause,
+            )
+            error.__context__ = cause
+            raise error
 
     def conforms(self, instance: object, format: str) -> bool:
         """
@@ -162,7 +412,7 @@ class FormatChecker:
         """
         try:
             self.check(instance, format)
-        except FormatError:
+        except (FormatError, ValidationError):
             return False
         else:
             return True

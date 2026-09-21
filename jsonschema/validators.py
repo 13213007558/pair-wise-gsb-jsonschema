@@ -12,11 +12,12 @@ from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 from urllib.request import urlopen
 from warnings import warn
 import contextlib
+import copy
 import json
 import reprlib
 import warnings
 
-from attrs import define, field, fields
+from attrs import define, evolve, field, fields
 from jsonschema_specifications import REGISTRY as SPECIFICATIONS
 from rpds import HashTrieMap
 import referencing.exceptions
@@ -226,7 +227,7 @@ def create(
         VALIDATORS = dict(validators)  # noqa: RUF012
         META_SCHEMA = dict(meta_schema)  # noqa: RUF012
         TYPE_CHECKER = type_checker
-        FORMAT_CHECKER = format_checker_arg
+        FORMAT_CHECKER = copy.deepcopy(format_checker_arg)
         ID_OF = staticmethod(id_of)
 
         _APPLICABLE_VALIDATORS = applicable_validators
@@ -303,6 +304,12 @@ def create(
                 id = id_of(self.schema)
                 if id is not None:
                     push_scope(id)
+
+        def __copy__(self):
+            format_checker = self.format_checker
+            if format_checker is not None:
+                format_checker = copy.copy(format_checker)
+            return evolve(self, format_checker=format_checker)
 
         @classmethod
         def check_schema(cls, schema, format_checker=_UNSET):

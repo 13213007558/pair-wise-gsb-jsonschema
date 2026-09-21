@@ -1,3 +1,8 @@
+v4.25.2
+~~~~~~~
+
+* Keep custom ``FormatChecker`` registries isolated per checker and validator instance, with explicit registration lifecycle, configurable undeclared-exception policies, and thread-safe validation snapshots.
+
 v4.25.1
 =======
 

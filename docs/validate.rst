@@ -253,6 +253,50 @@ Checker                    Notes
 
 The supported mechanism for ensuring these dependencies are present is again as shown above, not by directly installing the packages.
 
+Custom Formats
+~~~~~~~~~~~~~~
+
+Register custom formats on a dedicated `FormatChecker` instance rather than by mutating shared state.
+The returned ``checkers`` mapping is a point-in-time copy, so concurrent validation sees a consistent registry even while another thread registers, overrides, or unregisters formats.
+
+.. testcode::
+
+    from datetime import datetime
+    import re
+    from uuid import UUID
+
+    from jsonschema import FormatChecker
+
+    def is_custom_uuid(value):
+        return isinstance(value, str) and UUID(value).version == 4
+
+    def is_ulid(value):
+        return isinstance(value, str) and bool(
+            re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", value, re.IGNORECASE),
+        )
+
+    def is_custom_time(value):
+        if not isinstance(value, str):
+            return True
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return True
+
+    checker = FormatChecker(formats=())
+    checker.register("custom-uuid", is_custom_uuid, raises=ValueError)
+    checker.register("ulid", is_ulid)
+    checker.register("custom-time", is_custom_time, raises=ValueError)
+
+    with checker.registered(
+        "temporary-time",
+        is_custom_time,
+        raises=ValueError,
+    ):
+        pass  # The temporary checker is removed automatically here.
+
+Undeclared exceptions indicate a checker or dependency failure and propagate by default.
+To map them to a failed format instead, pass ``exception_policy=FormatChecker.INVALID``; use ``FormatChecker.IGNORE`` to treat them as valid, or provide a callable receiving ``(instance, format, error)``.
+Declared exceptions from ``raises`` and a checker returning ``False`` remain format failures with their original exception preserved as the cause.
+
 .. autoclass:: FormatChecker
     :members:
     :noindex:
@@ -260,8 +304,8 @@ The supported mechanism for ensuring these dependencies are present is again as 
 
     .. attribute:: checkers
 
-        A mapping of currently known formats to tuple of functions that validate them and errors that should be caught.
-        New checkers can be added and removed either per-instance or globally for all checkers using the `FormatChecker.checks` decorator.
+        A point-in-time mapping of currently known formats to tuples of functions that validate them and errors that should be caught.
+        Mutating this mapping does not change the checker; use `FormatChecker.register`, `FormatChecker.unregister`, `FormatChecker.registered`, or the `FormatChecker.checks` decorator.
 
     .. classmethod:: cls_checks(format, raises=())
 
