@@ -253,10 +253,18 @@ Checker                    Notes
 
 The supported mechanism for ensuring these dependencies are present is again as shown above, not by directly installing the packages.
 
+Custom formats can be registered on individual `FormatChecker` instances -- and overridden or unregistered again -- via `FormatChecker.register` and `FormatChecker.unregister`, without affecting the process-wide defaults or any other instance.
+A `jsonschema.FormatExceptionPolicy` controls how checker outcomes (falsy returns, declared exceptions, and unexpected exceptions from e.g. a fragile third-party library) map onto validation results.
+See `docs/examples/custom_format_checkers.py` for a complete, self-contained example which registers `uuid`, `ulid`, and `time` formats without touching any global state.
+
 .. autoclass:: FormatChecker
     :members:
     :noindex:
     :exclude-members: cls_checks
+
+.. autoclass:: jsonschema.FormatExceptionPolicy
+    :members:
+    :noindex:
 
     .. attribute:: checkers
 

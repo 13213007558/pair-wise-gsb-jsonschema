@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date, datetime
+from types import MappingProxyType
 from uuid import UUID
 import ipaddress
 import re
+import threading
 import typing
 import warnings
 
@@ -18,6 +21,80 @@ _RaisesType = typing.Union[type[Exception], tuple[type[Exception], ...]]
 _RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 
 
+#: The actions a FormatExceptionPolicy can take for a checker outcome.
+_POLICY_ACTIONS = frozenset({"error", "raise", "ignore"})
+
+
+@dataclass(frozen=True)
+class FormatExceptionPolicy:
+    """
+    How a FormatChecker maps checker outcomes onto validation results.
+
+    Each attribute names an action to take for one kind of checker outcome:
+
+        "error":
+
+            raise jsonschema.exceptions.FormatError. When an exception
+            is available it is preserved as both the error's `cause`
+            attribute and its `__cause__` (and the original traceback
+            remains available via `__context__`).
+
+        "raise":
+
+            re-raise the checker's own exception, propagating it to the
+            caller. Not valid for `on_false`, where no exception exists.
+
+        "ignore":
+
+            treat the instance as conforming to the format.
+
+    Attributes:
+
+        on_false:
+
+            The checker returned a falsy value. Defaults to "error".
+
+        on_declared:
+
+            The checker raised one of the exceptions it declared via the
+            `raises` argument of FormatChecker.checks (for example a
+            jsonschema.exceptions.ValidationError it chose to raise).
+            Defaults to "error".
+
+        on_unexpected:
+
+            The checker raised any other exception -- for example a bug in
+            an external library the checker depends on. Defaults to
+            "raise", preserving the historical behavior where such
+            exceptions propagate out of validation. Set to "error" to
+            convert them into validation failures instead of crashing the
+            validator.
+    """
+
+    on_false: str = "error"
+    on_declared: str = "error"
+    on_unexpected: str = "raise"
+
+    def __post_init__(self):
+        for name in ("on_false", "on_declared", "on_unexpected"):
+            action = getattr(self, name)
+            if action not in _POLICY_ACTIONS:
+                raise ValueError(
+                    f"{name} must be one of {sorted(_POLICY_ACTIONS)}, "
+                    f"got {action!r}.",
+                )
+        if self.on_false == "raise":
+            raise ValueError(
+                "on_false cannot be 'raise', as a falsy return value "
+                "carries no exception to re-raise.",
+            )
+
+
+#: The default policy, preserving historical FormatChecker behavior:
+#: falsy results and declared exceptions become FormatError instances, and
+#: any other exception propagates to the caller.
+DEFAULT_EXCEPTION_POLICY = FormatExceptionPolicy()
+
 class FormatChecker:
     """
     A ``format`` property checker.
@@ -30,7 +107,16 @@ class FormatChecker:
     formats that they do not know how to validate.
 
     To add a check for a custom format use the `FormatChecker.checks`
-    decorator.
+    decorator (or equivalently `FormatChecker.register`), and to remove
+    one use `FormatChecker.unregister`. Registering a format which is
+    already known replaces (overrides) the previous checker.
+
+    Each instance owns its own registry: registering, overriding, or
+    unregistering a checker on one instance never affects any other
+    instance, and all registration state is guarded by a lock so that
+    concurrent validation and registration cannot corrupt each other.
+    Validation itself reads from an immutable `FormatChecker.snapshot`
+    of the registry.
 
     Arguments:
 
@@ -39,6 +125,12 @@ class FormatChecker:
             The known formats to validate. This argument can be used to
             limit which formats will be used during validation.
 
+        exception_policy:
+
+            A `FormatExceptionPolicy` controlling how checker outcomes
+            (falsy returns, declared exceptions, and unexpected
+            exceptions) are mapped onto validation results.
+
     """
 
     checkers: dict[
@@ -46,13 +138,63 @@ class FormatChecker:
         tuple[_FormatCheckCallable, _RaisesType],
     ] = {}  # noqa: RUF012
 
-    def __init__(self, formats: typing.Iterable[str] | None = None):
-        if formats is None:
-            formats = self.checkers.keys()
-        self.checkers = {k: self.checkers[k] for k in formats}
+    _cls_lock = threading.RLock()
+
+    def __init__(
+        self,
+        formats: typing.Iterable[str] | None = None,
+        *,
+        exception_policy: FormatExceptionPolicy = DEFAULT_EXCEPTION_POLICY,
+    ):
+        self._lock = threading.RLock()
+        self.exception_policy = exception_policy
+        with FormatChecker._cls_lock:
+            if formats is None:
+                formats = list(self.checkers)
+            self.checkers = {k: self.checkers[k] for k in formats}
 
     def __repr__(self):
-        return f"<FormatChecker checkers={sorted(self.checkers)}>"
+        return f"<FormatChecker checkers={sorted(self.snapshot())}>"
+
+    def __copy__(self):
+        cls = self.__class__
+        new = cls.__new__(cls)
+        new._lock = threading.RLock()
+        new.exception_policy = self.exception_policy
+        with self._lock:
+            new.checkers = dict(self.checkers)
+        return new
+
+    def __deepcopy__(self, memo):
+        new = self.__copy__()
+        memo[id(self)] = new
+        return new
+
+    def __getstate__(self):
+        with self._lock:
+            checkers = dict(self.checkers)
+        return {
+            "checkers": checkers,
+            "exception_policy": self.exception_policy,
+        }
+
+    def __setstate__(self, state):
+        self._lock = threading.RLock()
+        self.checkers = dict(state["checkers"])
+        self.exception_policy = state["exception_policy"]
+
+    def snapshot(
+        self,
+    ) -> typing.Mapping[str, tuple[_FormatCheckCallable, _RaisesType]]:
+        """
+        Return an immutable, point-in-time view of this checker's registry.
+
+        The snapshot is consistent even if other threads concurrently
+        register or unregister checkers, and later mutations of this
+        checker do not affect it.
+        """
+        with self._lock:
+            return MappingProxyType(dict(self.checkers))
 
     def checks(
         self, format: str, raises: _RaisesType = (),
@@ -78,10 +220,71 @@ class FormatChecker:
         """
 
         def _checks(func: _F) -> _F:
-            self.checkers[format] = (func, raises)
+            self.register(format, func, raises=raises)
             return func
 
         return _checks
+
+    def register(
+        self,
+        format: str,
+        func: _F | None = None,
+        *,
+        raises: _RaisesType = (),
+    ) -> typing.Callable[[_F], _F] | _F:
+        """
+        Register a function as validating a format on this instance only.
+
+        Registering a format which is already known replaces (overrides)
+        the previous checker. May be called directly or used as a
+        decorator::
+
+            checker.register("uuid", is_uuid, raises=ValueError)
+
+            @checker.register("ulid")
+            def is_ulid(instance): ...
+
+        Arguments:
+
+            format:
+
+                The format that the function will check.
+
+            func:
+
+                The checker function. If omitted, a decorator is returned.
+
+            raises:
+
+                The exception(s) the function raises for invalid instances.
+
+        """
+        if func is None:
+            return lambda func: self.register(format, func, raises=raises)
+        with self._lock:
+            self.checkers[format] = (func, raises)
+        return func
+
+    def unregister(self, format: str) -> _FormatCheckCallable:
+        """
+        Remove the checker registered for the given format on this instance.
+
+        Returns the previously registered function. Other instances,
+        including the class-level defaults, are unaffected.
+
+        Raises:
+
+            KeyError: if no checker is registered for `format`
+
+        """
+        with self._lock:
+            try:
+                func, _ = self.checkers.pop(format)
+            except KeyError:
+                raise KeyError(
+                    f"no checker is registered for format {format!r}",
+                ) from None
+        return func
 
     @classmethod
     def cls_checks(
@@ -103,7 +306,8 @@ class FormatChecker:
         cls, format: str, raises: _RaisesType = (),
     ) -> typing.Callable[[_F], _F]:
         def _checks(func: _F) -> _F:
-            cls.checkers[format] = (func, raises)
+            with cls._cls_lock:
+                cls.checkers[format] = (func, raises)
             return func
 
         return _checks
@@ -129,17 +333,32 @@ class FormatChecker:
                 if the instance does not conform to ``format``
 
         """
-        if format not in self.checkers:
+        entry = self.snapshot().get(format)
+        if entry is None:
             return
 
-        func, raises = self.checkers[format]
-        result, cause = None, None
+        func, raises = entry
+        policy = self.exception_policy
         try:
             result = func(instance)
-        except raises as e:
-            cause = e
-        if not result:
-            raise FormatError(f"{instance!r} is not a {format!r}", cause=cause)
+        except raises as error:
+            if policy.on_declared == "raise":
+                raise
+            if policy.on_declared == "error":
+                raise FormatError(
+                    f"{instance!r} is not a {format!r}", cause=error,
+                ) from error
+            return
+        except Exception as error:
+            if policy.on_unexpected == "raise":
+                raise
+            if policy.on_unexpected == "error":
+                raise FormatError(
+                    f"{instance!r} is not a {format!r}", cause=error,
+                ) from error
+            return
+        if not result and policy.on_false == "error":
+            raise FormatError(f"{instance!r} is not a {format!r}")
 
     def conforms(self, instance: object, format: str) -> bool:
         """

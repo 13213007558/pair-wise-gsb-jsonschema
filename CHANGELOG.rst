@@ -1,3 +1,10 @@
+Unreleased
+==========
+
+* `FormatChecker` registries are now fully instance-bounded and thread-safe: each instance owns its registry, registration state is guarded by a lock, and validation reads from an immutable `FormatChecker.snapshot`.
+  Add `FormatChecker.register` / `FormatChecker.unregister` for an explicit register / override / unregister lifecycle, and `jsonschema.FormatExceptionPolicy` for configuring how falsy results, declared exceptions, and unexpected exceptions from checkers map onto validation results.
+  Copying, deep-copying, and pickling a `FormatChecker` now produces an independent registry.
+
 v4.25.1
 =======
 
