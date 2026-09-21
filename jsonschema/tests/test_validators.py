@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections import deque, namedtuple
 from contextlib import contextmanager
 from decimal import Decimal
@@ -2006,6 +2007,266 @@ class TestLatestValidator(TestCase):
 
         with self.assertRaises(exceptions.ValidationError):
             validator.validate(None)
+
+
+def _is_decimal_aware_number(checker, instance):
+    if isinstance(instance, bool):
+        return False
+    return isinstance(instance, (int, float, Decimal))
+
+
+def _is_mapping_object(checker, instance):
+    return isinstance(instance, Mapping)
+
+
+class _CustomMapping:
+    def __init__(self, **kwargs):
+        self._data = kwargs
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+
+Mapping.register(_CustomMapping)
+
+
+class TestRedefinedTypeCheckerPropagation(TestCase):
+    """
+    A redefined type checker must stay bound to every validator derived
+    from it, recursively, and must never silently revert to the checker
+    of the underlying stock validator class.
+    """
+
+    def setUp(self):
+        self.type_checker = validators._LATEST_VERSION.TYPE_CHECKER
+        self.redefined = self.type_checker.redefine_many({
+            "number": _is_decimal_aware_number,
+            "object": _is_mapping_object,
+        })
+        self.Validator = validators.extend(
+            validators._LATEST_VERSION,
+            type_checker=self.redefined,
+        )
+
+    def test_nested_anyOf_keeps_redefined_checker(self):
+        schema = {
+            "anyOf": [
+                {
+                    "$schema": (
+                        validators._LATEST_VERSION.META_SCHEMA["$id"]
+                    ),
+                    "type": "number",
+                },
+            ],
+        }
+        validator = self.Validator(schema)
+        self.assertTrue(validator.is_valid(Decimal("1.5")))
+        self.assertFalse(validator.is_valid("foo"))
+
+    def test_evolve_keeps_redefined_checker(self):
+        validator = self.Validator({"type": "number"})
+        evolved = validator.evolve(
+            schema={
+                "$schema": validators._LATEST_VERSION.META_SCHEMA["$id"],
+                "type": "number",
+            },
+        )
+        self.assertIs(evolved._type_checker, self.redefined)
+        self.assertTrue(evolved.is_valid(Decimal("1.5")))
+
+    def test_ref_keeps_redefined_checker(self):
+        schema = {
+            "$schema": validators._LATEST_VERSION.META_SCHEMA["$id"],
+            "$ref": "#/$defs/number",
+            "$defs": {"number": {"type": "number"}},
+        }
+        validator = self.Validator(schema)
+        self.assertTrue(validator.is_valid(Decimal("1.5")))
+        self.assertFalse(validator.is_valid("foo"))
+
+    def test_recursive_ref_keeps_redefined_checker(self):
+        type_checker = validators.Draft201909Validator.TYPE_CHECKER
+        redefined = type_checker.redefine_many({
+            "number": _is_decimal_aware_number,
+            "object": _is_mapping_object,
+        })
+        Validator = validators.extend(
+            validators.Draft201909Validator,
+            type_checker=redefined,
+        )
+        schema = {
+            "$schema": validators.Draft201909Validator.META_SCHEMA["$id"],
+            "$recursiveAnchor": True,
+            "type": "object",
+            "properties": {
+                "child": {"$recursiveRef": "#"},
+                "n": {"type": "number"},
+            },
+        }
+        validator = Validator(schema)
+        instance = _CustomMapping(
+            child=_CustomMapping(n=Decimal("2.5")),
+            n=Decimal("1.5"),
+        )
+        self.assertEqual(list(validator.iter_errors(instance)), [])
+
+    def test_error_context_uses_redefined_checker(self):
+        validator = self.Validator({"anyOf": [{"type": "number"}]})
+        error, = validator.iter_errors("foo")
+        self.assertIs(error._type_checker, self.redefined)
+        context, = error.context
+        self.assertIs(context._type_checker, self.redefined)
+
+    def test_with_checker(self):
+        Validator = validators._LATEST_VERSION.with_checker(self.redefined)
+        validator = Validator({"type": "object"})
+        self.assertTrue(validator.is_valid(_CustomMapping()))
+        self.assertFalse(validator.is_valid("foo"))
+        # the original class is untouched
+        self.assertIs(
+            validators._LATEST_VERSION.TYPE_CHECKER,
+            self.type_checker,
+        )
+        self.assertFalse(
+            validators._LATEST_VERSION({"type": "object"}).is_valid(
+                _CustomMapping(),
+            ),
+        )
+
+    def test_redefined_checker_does_not_leak_into_stock_checkers(self):
+        self.assertTrue(self.redefined.is_type(Decimal("1.5"), "number"))
+        self.assertTrue(self.redefined.is_type(_CustomMapping(), "object"))
+        self.assertFalse(self.type_checker.is_type(_CustomMapping(), "object"))
+        self.assertIs(
+            validators._LATEST_VERSION.TYPE_CHECKER,
+            self.type_checker,
+        )
+
+    def test_pickle_and_copy_preserve_redefined_checker(self):
+        import copy
+        import pickle
+
+        validator = self.Validator({"type": "number"})
+
+        unpickled = pickle.loads(pickle.dumps(validator))
+        self.assertEqual(unpickled._type_checker, self.redefined)
+        self.assertTrue(unpickled.is_valid(Decimal("1.5")))
+        self.assertFalse(unpickled.is_valid("foo"))
+
+        copied = copy.copy(validator)
+        self.assertIs(copied._type_checker, self.redefined)
+        self.assertTrue(copied.is_valid(Decimal("1.5")))
+
+        deepcopied = copy.deepcopy(validator)
+        self.assertEqual(deepcopied._type_checker, self.redefined)
+        self.assertTrue(deepcopied.is_valid(Decimal("1.5")))
+
+    def test_pickle_type_checker_preserves_redefinitions(self):
+        import pickle
+
+        unpickled = pickle.loads(pickle.dumps(self.redefined))
+        self.assertEqual(unpickled, self.redefined)
+        self.assertTrue(unpickled.is_type(Decimal("1.5"), "number"))
+
+    def test_stock_type_checkers_are_picklable(self):
+        import pickle
+
+        for checker in [
+            validators.Draft3Validator.TYPE_CHECKER,
+            validators.Draft4Validator.TYPE_CHECKER,
+            validators.Draft6Validator.TYPE_CHECKER,
+            validators.Draft7Validator.TYPE_CHECKER,
+            validators.Draft201909Validator.TYPE_CHECKER,
+            validators.Draft202012Validator.TYPE_CHECKER,
+        ]:
+            self.assertEqual(pickle.loads(pickle.dumps(checker)), checker)
+
+    def test_concurrent_redefinitions_do_not_interfere(self):
+        from threading import Thread
+
+        custom = self.Validator({"type": "object"})
+        stock = validators._LATEST_VERSION({"type": "object"})
+
+        failures = []
+
+        def check(validator, instance, expected):
+            try:
+                for _ in range(200):
+                    if validator.is_valid(instance) != expected:
+                        failures.append((validator, instance))
+            except Exception as e:  # pragma: no cover
+                failures.append(e)
+
+        threads = [
+            Thread(target=check, args=(custom, _CustomMapping(), True)),
+            Thread(target=check, args=(custom, {"a": 1}, True)),
+            Thread(target=check, args=(stock, _CustomMapping(), False)),
+            Thread(target=check, args=(stock, {"a": 1}, True)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(failures, [])
+        self.assertIs(
+            validators._LATEST_VERSION.TYPE_CHECKER,
+            self.type_checker,
+        )
+
+    def test_concurrent_redefinitions_do_not_interfere(self):
+        from threading import Thread
+
+        decimal_only = self.type_checker.redefine(
+            "number",
+            lambda checker, instance: isinstance(instance, Decimal),
+        )
+        First = validators.extend(
+            validators._LATEST_VERSION, type_checker=decimal_only,
+        )
+        Second = validators.extend(
+            validators._LATEST_VERSION, type_checker=self.redefined,
+        )
+
+        failures = []
+
+        def check(validator, instance, expected):
+            try:
+                for _ in range(100):
+                    if validator.is_valid(instance) != expected:
+                        failures.append((validator, instance))
+            except Exception as e:  # pragma: no cover
+                failures.append(e)
+
+        threads = [
+            Thread(
+                target=check,
+                args=(First({"type": "number"}), Decimal("1.5"), True),
+            ),
+            Thread(
+                target=check,
+                args=(First({"type": "number"}), 1.5, False),
+            ),
+            Thread(
+                target=check,
+                args=(Second({"type": "number"}), 1.5, True),
+            ),
+            Thread(
+                target=check,
+                args=(Second({"type": "number"}), Decimal("1.5"), True),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
 
 
 class TestValidatorFor(TestCase):

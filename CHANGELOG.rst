@@ -1,3 +1,17 @@
+v4.25.2
+=======
+
+* Type checker redefinitions (via TypeChecker.redefine / redefine_many,
+  extend, or the new Validator.with_checker) are now bound to each
+  validator instance, so they propagate consistently to all derived
+  validators -- including when descending into subschemas which declare
+  a $schema keyword, across $ref / $recursiveRef resolution, evolve,
+  format validation, check_schema and iter_errors (including error
+  context).
+* TypeChecker now eagerly rejects non-callable check functions at
+  construction time, and type checkers (as well as validator instances)
+  can now be pickled and copied while preserving any redefined types.
+
 v4.25.1
 =======
 

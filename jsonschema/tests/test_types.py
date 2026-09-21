@@ -57,9 +57,21 @@ class TestTypeChecker(TestCase):
 
     def test_redefine_existing_type(self):
         self.assertEqual(
-            TypeChecker().redefine("two", object()).redefine("two", equals_2),
+            TypeChecker().redefine("two", str).redefine("two", equals_2),
             TypeChecker().redefine("two", equals_2),
         )
+
+    def test_redefine_rejects_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker().redefine("two", object())
+
+    def test_redefine_many_rejects_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker().redefine_many({"foo": int, "bar": object()})
+
+    def test_init_rejects_non_callable(self):
+        with self.assertRaises(TypeError):
+            TypeChecker({"two": object()})
 
     def test_remove(self):
         self.assertEqual(

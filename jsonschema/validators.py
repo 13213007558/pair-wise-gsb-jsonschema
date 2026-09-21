@@ -12,6 +12,7 @@ from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 from urllib.request import urlopen
 from warnings import warn
 import contextlib
+import itertools
 import json
 import reprlib
 import warnings
@@ -39,6 +40,23 @@ _UNSET = _utils.Unset()
 
 _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
+
+
+# Registries mapping each validator class created by create() to a token
+# (and back), allowing validator instances to be pickled even though their
+# classes are created dynamically. Each class is registered exactly once,
+# and instances carry their own (immutable) state, so concurrent use of
+# differently-derived validators does not interfere.
+_VALIDATOR_CLASS_TOKENS: dict[type, int] = {}
+_TOKEN_TO_VALIDATOR_CLASS: dict[int, type] = {}
+_validator_class_counter = itertools.count()
+
+
+def _unpickle_validator(token, state):
+    cls = _TOKEN_TO_VALIDATOR_CLASS[token]
+    validator = cls.__new__(cls)
+    validator.__setstate__(state)
+    return validator
 
 
 def __getattr__(name):
@@ -247,6 +265,12 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _type_checker: _types.TypeChecker | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+            alias="type_checker",
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -281,6 +305,14 @@ def create(
             cls.evolve = evolve
 
         def __attrs_post_init__(self):
+            if self._type_checker is None:
+                # Bind the (possibly redefined) type checker of the class
+                # to this instance, so that all validators derived from it
+                # -- whether by evolve(), descend(), $ref resolution or
+                # otherwise -- keep using this exact immutable snapshot,
+                # even if validator_for() selects a different class.
+                self._type_checker = self.TYPE_CHECKER
+
             if self._resolver is None:
                 registry = self._registry
                 if registry is not _REMOTE_WARNING_REGISTRY:
@@ -308,13 +340,38 @@ def create(
         def check_schema(cls, schema, format_checker=_UNSET):
             Validator = validator_for(cls.META_SCHEMA, default=cls)
             if format_checker is _UNSET:
-                format_checker = Validator.FORMAT_CHECKER
+                format_checker = cls.FORMAT_CHECKER
             validator = Validator(
                 schema=cls.META_SCHEMA,
                 format_checker=format_checker,
+                type_checker=cls.TYPE_CHECKER,
             )
             for error in validator.iter_errors(schema):
                 raise exceptions.SchemaError.create_from(error)
+
+        @classmethod
+        def with_checker(cls, type_checker):
+            """
+            Create a new validator class like this one, but which uses the
+            given type checker.
+
+            The new class is an independent, immutable snapshot: it carries
+            along this class's validators, meta schema, format checker and
+            ID resolution behavior, and the given type checker is used for
+            all type validation, including within any validators derived
+            from the new class.
+
+            Arguments:
+
+                type_checker (jsonschema.TypeChecker):
+
+                    a type checker, used when applying the type keyword
+
+            Returns:
+
+                a new jsonschema.protocols.Validator class
+            """
+            return extend(cls, type_checker=type_checker)
 
         @property
         def resolver(self):
@@ -388,7 +445,7 @@ def create(
                         validator_value=v,
                         instance=instance,
                         schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
+                        type_checker=self._type_checker,
                     )
                     if k not in {"if", "$ref"}:
                         error.schema_path.appendleft(k)
@@ -436,7 +493,7 @@ def create(
                         validator_value=v,
                         instance=instance,
                         schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
+                        type_checker=evolved._type_checker,
                     )
                     if k not in {"if", "$ref"}:
                         error.schema_path.appendleft(k)
@@ -452,7 +509,7 @@ def create(
 
         def is_type(self, instance, type):
             try:
-                return self.TYPE_CHECKER.is_type(instance, type)
+                return self._type_checker.is_type(instance, type)
             except exceptions.UndefinedTypeCheck:
                 exc = exceptions.UnknownType(type, instance, self.schema)
                 raise exc from None
@@ -500,6 +557,42 @@ def create(
             error = next(self.iter_errors(instance), None)
             return error is None
 
+        def __getstate__(self):
+            # The (derived) resolver is not picklable, but it is fully
+            # determined by the schema and registry, so it is recomputed
+            # on restoration. The default registry is shared process-wide
+            # and is restored by identity rather than serialized.
+            registry = self._registry
+            return {
+                "schema": self.schema,
+                "resolver": self._ref_resolver,
+                "format_checker": self.format_checker,
+                "registry": (
+                    None if registry is _REMOTE_WARNING_REGISTRY else registry
+                ),
+                "type_checker": self._type_checker,
+            }
+
+        def __setstate__(self, state):
+            registry = state["registry"]
+            if registry is None:
+                registry = _REMOTE_WARNING_REGISTRY
+            self.__init__(
+                schema=state["schema"],
+                resolver=state["resolver"],
+                format_checker=state["format_checker"],
+                registry=registry,
+                type_checker=state["type_checker"],
+            )
+
+        def __reduce__(self):
+            token = _VALIDATOR_CLASS_TOKENS.get(self.__class__)
+            if token is None:
+                # A class not created by create() (e.g. a subclass); fall
+                # back to the default behavior.
+                return super().__reduce__()
+            return (_unpickle_validator, (token, self.__getstate__()))
+
     evolve_fields = [
         (field.name, field.alias)
         for field in fields(Validator)
@@ -510,6 +603,10 @@ def create(
         safe = version.title().replace(" ", "").replace("-", "")
         Validator.__name__ = Validator.__qualname__ = f"{safe}Validator"
         Validator = validates(version)(Validator)  # type: ignore[misc]
+
+    token = next(_validator_class_counter)
+    _VALIDATOR_CLASS_TOKENS[Validator] = token
+    _TOKEN_TO_VALIDATOR_CLASS[token] = Validator
 
     return Validator  # type: ignore[return-value]
 

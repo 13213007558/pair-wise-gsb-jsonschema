@@ -23,6 +23,18 @@ def _typed_map_converter(
     return HashTrieMap.convert(init_val)
 
 
+def _ensure_callable_checkers(instance, attribute, value):
+    """
+    Reject non-callable type check functions eagerly, at construction time.
+    """
+    for type, fn in value.items():
+        if not callable(fn):
+            raise TypeError(
+                f"{fn!r} is not callable, and so cannot be used to check "
+                f"whether an instance is of type {type!r}.",
+            )
+
+
 def is_array(checker, instance):
     return isinstance(instance, list)
 
@@ -36,6 +48,13 @@ def is_integer(checker, instance):
     if isinstance(instance, bool):
         return False
     return isinstance(instance, int)
+
+
+def is_integer_or_integral_float(checker, instance):
+    # bool inherits from int, so ensure bools aren't reported as ints
+    if is_integer(checker, instance):
+        return True
+    return isinstance(instance, float) and instance.is_integer()
 
 
 def is_null(checker, instance):
@@ -85,7 +104,11 @@ class TypeChecker:
 
     _type_checkers: HashTrieMap[
         str, Callable[[TypeChecker, Any], bool],
-    ] = field(default=HashTrieMap(), converter=_typed_map_converter)
+    ] = field(
+        default=HashTrieMap(),
+        converter=_typed_map_converter,
+        validator=_ensure_callable_checkers,
+    )
 
     def __repr__(self):
         types = ", ".join(repr(k) for k in sorted(self._type_checkers))
@@ -194,10 +217,7 @@ draft3_type_checker = TypeChecker(
 draft4_type_checker = draft3_type_checker.remove("any")
 draft6_type_checker = draft4_type_checker.redefine(
     "integer",
-    lambda checker, instance: (
-        is_integer(checker, instance)
-        or (isinstance(instance, float) and instance.is_integer())
-    ),
+    is_integer_or_integral_float,
 )
 draft7_type_checker = draft6_type_checker
 draft201909_type_checker = draft7_type_checker
