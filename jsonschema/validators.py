@@ -297,13 +297,6 @@ def create(
                     if k in self.VALIDATORS
                 ]
 
-            # REMOVEME: Legacy ref resolution state management.
-            push_scope = getattr(self._ref_resolver, "push_scope", None)
-            if push_scope is not None:
-                id = id_of(self.schema)
-                if id is not None:
-                    push_scope(id)
-
         @classmethod
         def check_schema(cls, schema, format_checker=_UNSET):
             Validator = validator_for(cls.META_SCHEMA, default=cls)
@@ -379,20 +372,35 @@ def create(
                 )
                 return
 
-            for validator, k, v in validators:
-                errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+            # REMOVEME: Legacy ref resolution state management.
+            # The scope is entered only for the duration of this call, so
+            # that call-level state never leaks into a shared resolver.
+            push_scope = getattr(self._ref_resolver, "push_scope", None)
+            pushed = False
+            if push_scope is not None:
+                id = id_of(_schema)
+                if id is not None:
+                    push_scope(id)
+                    pushed = True
+
+            try:
+                for validator, k, v in validators:
+                    errors = validator(self, v, instance, _schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=_schema,
+                            type_checker=self.TYPE_CHECKER,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        yield error
+            finally:
+                if pushed:
+                    self._ref_resolver.pop_scope()
 
         def descend(
             self,
@@ -423,28 +431,43 @@ def create(
                     )
                 evolved = self.evolve(schema=schema, _resolver=resolver)
 
-            for k, v in applicable_validators(schema):
-                validator = evolved.VALIDATORS.get(k)
-                if validator is None:
-                    continue
+            # REMOVEME: Legacy ref resolution state management.
+            # The scope is entered only for the duration of this call, so
+            # that call-level state never leaks into a shared resolver.
+            push_scope = getattr(self._ref_resolver, "push_scope", None)
+            pushed = False
+            if push_scope is not None:
+                id = id_of(schema)
+                if id is not None:
+                    push_scope(id)
+                    pushed = True
 
-                errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+            try:
+                for k, v in applicable_validators(schema):
+                    validator = evolved.VALIDATORS.get(k)
+                    if validator is None:
+                        continue
+
+                    errors = validator(evolved, v, instance, schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=schema,
+                            type_checker=evolved.TYPE_CHECKER,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        if path is not None:
+                            error.path.appendleft(path)
+                        if schema_path is not None:
+                            error.schema_path.appendleft(schema_path)
+                        yield error
+            finally:
+                if pushed:
+                    self._ref_resolver.pop_scope()
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):

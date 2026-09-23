@@ -1,3 +1,12 @@
+v4.25.2
+=======
+
+* Fix a leak of resolution scope across validation calls when using the
+  (deprecated) legacy ``RefResolver`` interface.
+  Scope is now entered and exited within each validation call rather than
+  accumulating on the shared resolver, so reusing a validator no longer
+  corrupts subsequent validations.
+
 v4.25.1
 =======
 

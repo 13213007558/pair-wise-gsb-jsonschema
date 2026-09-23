@@ -2545,6 +2545,263 @@ class TestRefResolver(TestCase):
 
 
 
+class TestLegacyRefResolverScopeIsolation(TestCase):
+    """
+    The (deprecated) legacy ref resolution path keeps its resolution scope
+    on a shared, mutable resolver. That call-level state must be entered
+    and exited within each validation call, never leaking into subsequent
+    calls on the same validator.
+    """
+
+    def test_creating_validators_does_not_mutate_the_resolver(self):
+        schema = {"$id": "http://example.com/root"}
+        resolver = validators._RefResolver.from_schema(schema)
+        before = list(resolver._scopes_stack)
+
+        validators.Draft7Validator(schema, resolver=resolver)
+        validators.Draft7Validator(schema, resolver=resolver).evolve(
+            schema={"$id": "http://example.com/other"},
+        )
+
+        self.assertEqual(resolver._scopes_stack, before)
+
+    def test_scope_is_released_after_each_validate(self):
+        schema = {
+            "$id": "http://example.com/root",
+            "properties": {"x": {"$ref": "sub/child"}},
+        }
+        child = {"$id": "http://example.com/sub/child", "type": "string"}
+        resolver = validators._RefResolver.from_schema(
+            schema,
+            store={child["$id"]: child},
+        )
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        for _ in range(3):
+            error, = validator.iter_errors({"x": 1})
+            self.assertEqual(error.message, "1 is not of type 'string'")
+            self.assertEqual(
+                resolver._scopes_stack,
+                ["http://example.com/root"],
+            )
+
+    def test_scope_is_released_when_resolution_fails(self):
+        schema = {
+            "$id": "http://example.com/root",
+            "properties": {
+                "x": {"$ref": "sub/child"},
+                "boom": {"$ref": "#/definitions/missing"},
+            },
+        }
+        child = {"$id": "http://example.com/sub/child", "type": "string"}
+        resolver = validators._RefResolver.from_schema(
+            schema,
+            store={child["$id"]: child},
+        )
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        with self.assertRaises(exceptions._RefResolutionError):
+            validator.validate({"boom": 1})
+        self.assertEqual(
+            resolver._scopes_stack,
+            ["http://example.com/root"],
+        )
+
+        # And the resolver is still usable for further calls afterwards.
+        error, = validator.iter_errors({"x": 1})
+        self.assertEqual(error.message, "1 is not of type 'string'")
+        self.assertEqual(
+            resolver._scopes_stack,
+            ["http://example.com/root"],
+        )
+
+    def test_interleaved_resources_do_not_contaminate_each_other(self):
+        tenant_a = {
+            "$id": "http://example.com/tenantA/schema",
+            "properties": {"child": {"$ref": "node"}},
+        }
+        tenant_a_node = {
+            "$id": "http://example.com/tenantA/node",
+            "type": "string",
+        }
+        tenant_b = {
+            "$id": "http://example.com/tenantB/schema",
+            "properties": {"child": {"$ref": "node"}},
+        }
+        tenant_b_node = {
+            "$id": "http://example.com/tenantB/node",
+            "type": "integer",
+        }
+        schema = {
+            "$id": "http://example.com/api",
+            "properties": {
+                "a": {"$ref": "tenantA/schema"},
+                "b": {"$ref": "tenantB/schema"},
+            },
+        }
+        store = {
+            each["$id"]: each
+            for each in [tenant_a, tenant_a_node, tenant_b, tenant_b_node]
+        }
+        resolver = validators._RefResolver.from_schema(schema, store=store)
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        instance = {"a": {"child": 1}, "b": {"child": "x"}}
+        expected = [
+            "'x' is not of type 'integer'",
+            "1 is not of type 'string'",
+        ]
+        for _ in range(3):
+            errors = validator.iter_errors(instance)
+            self.assertEqual(
+                sorted(error.message for error in errors),
+                expected,
+            )
+            self.assertEqual(
+                resolver._scopes_stack,
+                ["http://example.com/api"],
+            )
+
+
+class TestDynamicScopeIsolation(TestCase):
+    """
+    The dynamic scope used to resolve ``$dynamicRef`` is call-level state.
+    It must be isolated to each validation call even when a single
+    validator instance is reused across instances (tenants), generators,
+    or threads.
+    """
+
+    def setUp(self):
+        def tenant(name, type_):
+            return {
+                "$id": f"https://example.com/{name}",
+                "$dynamicAnchor": "node",
+                "type": "object",
+                "properties": {
+                    "children": {
+                        "type": "array",
+                        "items": {"$dynamicRef": "#node"},
+                    },
+                    "value": {"type": type_},
+                },
+            }
+
+        root = {
+            "$id": "https://example.com/api",
+            "properties": {
+                "a": {"$ref": "tenantA"},
+                "b": {"$ref": "tenantB"},
+            },
+        }
+        registry = referencing.Registry()
+        for resource in [
+            root,
+            tenant("tenantA", "string"),
+            tenant("tenantB", "integer"),
+        ]:
+            registry = registry.with_resource(
+                resource["$id"],
+                DRAFT202012.create_resource(resource),
+            )
+        self.validator = validators.Draft202012Validator(
+            root,
+            registry=registry,
+        )
+
+    def test_dynamic_scope_does_not_leak_between_validate_calls(self):
+        instance = {
+            "a": {"value": 1, "children": [{"value": 1}]},
+            "b": {"value": "x", "children": [{"value": "x"}]},
+        }
+        expected = [
+            (
+                ["a", "children", 0, "value"],
+                [
+                    "properties", "a", "properties", "children", "items",
+                    "$dynamicRef", "properties", "value", "type",
+                ],
+                "1 is not of type 'string'",
+            ),
+            (
+                ["a", "value"],
+                ["properties", "a", "properties", "value", "type"],
+                "1 is not of type 'string'",
+            ),
+            (
+                ["b", "children", 0, "value"],
+                [
+                    "properties", "b", "properties", "children", "items",
+                    "$dynamicRef", "properties", "value", "type",
+                ],
+                "'x' is not of type 'integer'",
+            ),
+            (
+                ["b", "value"],
+                ["properties", "b", "properties", "value", "type"],
+                "'x' is not of type 'integer'",
+            ),
+        ]
+        for _ in range(3):
+            errors = self.validator.iter_errors(instance)
+            self.assertEqual(
+                [
+                    (
+                        list(error.absolute_path),
+                        list(error.absolute_schema_path),
+                        error.message,
+                    )
+                    for error in errors
+                ],
+                expected,
+            )
+
+    def test_interleaved_iteration_does_not_share_dynamic_scope(self):
+        first = self.validator.iter_errors({"a": {"value": 1}})
+        second = self.validator.iter_errors({"b": {"value": "x"}})
+
+        self.assertEqual(next(first).message, "1 is not of type 'string'")
+        self.assertEqual(
+            next(second).message,
+            "'x' is not of type 'integer'",
+        )
+        self.assertEqual(list(first), [])
+        self.assertEqual(list(second), [])
+
+    def test_dynamic_scope_is_not_shared_across_threads(self):
+        from threading import Thread
+
+        failures = []
+
+        def validate(instance, message):
+            try:
+                for _ in range(50):
+                    error, = self.validator.iter_errors(instance)
+                    if error.message != message:  # pragma: no cover
+                        failures.append(error.message)
+            except Exception as e:  # pragma: no cover
+                failures.append(e)
+
+        threads = [
+            Thread(
+                target=validate,
+                args=({"a": {"value": 1}}, "1 is not of type 'string'"),
+            ),
+            Thread(
+                target=validate,
+                args=(
+                    {"b": {"value": "x"}},
+                    "'x' is not of type 'integer'",
+                ),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(failures, [])
+
+
 def sorted_errors(errors):
     def key(error):
         return (
