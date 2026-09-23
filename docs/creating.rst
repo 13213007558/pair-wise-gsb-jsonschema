@@ -19,6 +19,21 @@ Creating or Extending Validator Classes
     :noindex:
 
 
+Preparing Dialects with Vocabulary Checking
+--------------------------------------------
+
+.. autoclass:: VocabularyRegistry
+    :members:
+    :noindex:
+
+.. autoclass:: PreparedDialect
+    :members:
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.UnsupportedVocabulary
+    :noindex:
+
+
 Creating Validation Errors
 --------------------------
 

@@ -303,6 +303,320 @@ class TestCreateAndExtend(TestCase):
         self.assertTrue(Derived(schema).is_valid(37))
 
 
+def company_keyword(validator, expected, instance, schema):
+    if instance != expected:
+        yield exceptions.ValidationError(
+            f"{instance!r} is not {expected!r}",
+        )
+
+
+def opaque_resource(meta_schema):
+    return referencing.Resource.from_contents(
+        meta_schema,
+        default_specification=referencing.Specification.OPAQUE,
+    )
+
+
+class TestVocabularyPreparation(TestCase):
+
+    VOCABULARY = "https://example.com/vocab/company"
+    META = "https://example.com/meta/strict"
+
+    def setUp(self):
+        self.addCleanup(
+            self.assertEqual,
+            validators._META_SCHEMAS,
+            dict(validators._META_SCHEMAS),
+        )
+        self.addCleanup(
+            self.assertEqual,
+            validators._VALIDATORS,
+            dict(validators._VALIDATORS),
+        )
+
+        self.meta_schema = {
+            "$id": self.META,
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                self.VOCABULARY: True,
+            },
+        }
+        self.vocabularies = validators.VocabularyRegistry()
+
+    def prepare(self, **kwargs):
+        kwargs.setdefault("meta_schema", self.meta_schema)
+        return self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            **kwargs,
+        )
+
+    def register_vocabulary(self, meta_schemas=()):
+        self.vocabularies.register(
+            self.VOCABULARY,
+            keywords={"companyKeyword": company_keyword},
+            meta_schemas=meta_schemas,
+        )
+
+    def test_unknown_required_vocabulary_is_rejected(self):
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            self.prepare()
+
+        self.assertEqual(cm.exception.vocabularies, (self.VOCABULARY,))
+        self.assertEqual(cm.exception.uri, self.META)
+        self.assertIn(self.VOCABULARY, str(cm.exception))
+        self.assertIn(self.META, str(cm.exception))
+
+    def test_unknown_optional_vocabulary_is_ignored(self):
+        meta_schema = {
+            "$id": "https://example.com/meta/optional",
+            "$vocabulary": {self.VOCABULARY: False},
+        }
+        prepared = self.prepare(meta_schema=meta_schema)
+        self.assertTrue(prepared.is_valid(12, {"type": "integer"}))
+
+    def test_registered_vocabulary_keywords_are_applied(self):
+        self.register_vocabulary(meta_schemas={self.META})
+        prepared = self.prepare()
+
+        prepared.validate("ok", {"companyKeyword": "ok"})
+        with self.assertRaises(exceptions.ValidationError):
+            prepared.validate("nope", {"companyKeyword": "ok"})
+
+    def test_support_is_not_inferred_from_the_uri(self):
+        self.register_vocabulary()
+        meta_schema = {
+            "$id": "https://example.com/meta/other",
+            "$vocabulary": {self.VOCABULARY + "/v2": True},
+        }
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            self.prepare(meta_schema=meta_schema)
+        self.assertEqual(
+            cm.exception.vocabularies,
+            (self.VOCABULARY + "/v2",),
+        )
+
+    def test_registration_is_scoped_to_its_meta_schemas(self):
+        self.register_vocabulary(
+            meta_schemas={"https://example.com/meta/unrelated"},
+        )
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            self.prepare()
+
+    def test_meta_schemas_differing_only_in_required_flag(self):
+        optional = {
+            "$id": "https://example.com/meta/optional",
+            "$vocabulary": {self.VOCABULARY: False},
+        }
+        required = {
+            "$id": "https://example.com/meta/required",
+            "$vocabulary": {self.VOCABULARY: True},
+        }
+
+        prepared = self.prepare(meta_schema=optional)
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            self.prepare(meta_schema=required)
+
+        # the successful preparation is unaffected by the failure
+        self.assertTrue(prepared.is_valid(12, {"type": "integer"}))
+        self.assertFalse(prepared.is_valid("x", {"type": "integer"}))
+
+    def test_failure_happens_before_any_instance_keyword_runs(self):
+        called = []
+
+        def recording(validator, value, instance, schema):
+            called.append((value, instance))
+
+        meta_schema = {
+            "$id": "https://example.com/meta/nested",
+            "$vocabulary": {self.VOCABULARY: True},
+        }
+        registry = referencing.Registry().with_resource(
+            meta_schema["$id"],
+            opaque_resource(meta_schema),
+        )
+        Base = validators.extend(
+            validators.Draft202012Validator,
+            {"recording": recording},
+        )
+        prepared = self.vocabularies.prepare(Base, registry=registry)
+
+        schema = {
+            "properties": {
+                "nested": {
+                    "$schema": meta_schema["$id"],
+                    "recording": 1,
+                },
+            },
+        }
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            prepared.validate({"nested": 1}, schema)
+        self.assertEqual(called, [])
+
+    def test_boolean_schemas_use_the_prepared_dialect(self):
+        meta_schema = {
+            "$id": "https://example.com/meta/optional",
+            "$vocabulary": {self.VOCABULARY: False},
+        }
+        prepared = self.prepare(meta_schema=meta_schema)
+        self.assertTrue(prepared.is_valid("anything", True))
+        self.assertFalse(prepared.is_valid("anything", False))
+
+    def test_boolean_meta_schema_declares_no_vocabularies(self):
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            meta_schema=True,
+        )
+        self.assertTrue(prepared.is_valid(12, {"type": "integer"}))
+
+    def test_nested_resources_use_their_own_schema(self):
+        meta_schema = {
+            "$id": "https://example.com/meta/nested",
+            "$vocabulary": {self.VOCABULARY: True},
+        }
+        registry = referencing.Registry().with_resource(
+            meta_schema["$id"],
+            opaque_resource(meta_schema),
+        )
+        schema = {
+            "properties": {
+                "nested": {
+                    "$schema": meta_schema["$id"],
+                    "companyKeyword": 37,
+                },
+            },
+        }
+
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            registry=registry,
+        )
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            prepared.validate({"nested": 37}, schema)
+        self.assertEqual(cm.exception.uri, meta_schema["$id"])
+
+        self.register_vocabulary(meta_schemas={meta_schema["$id"]})
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid({"nested": 37}, schema))
+        self.assertFalse(prepared.is_valid({"nested": 12}, schema))
+
+    def test_custom_dialect_found_via_registry(self):
+        registry = referencing.Registry().with_resource(
+            self.META,
+            opaque_resource(self.meta_schema),
+        )
+        schema = {"$schema": self.META, "companyKeyword": 37}
+
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            registry=registry,
+        )
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            prepared(schema)
+
+        self.register_vocabulary(meta_schemas={self.META})
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid(37, schema))
+        self.assertFalse(prepared.is_valid(12, schema))
+
+    def test_ref_into_resource_with_its_own_schema(self):
+        meta_schema = {
+            "$id": "https://example.com/meta/nested",
+            "$vocabulary": {self.VOCABULARY: True},
+        }
+        registry = referencing.Registry().with_resource(
+            meta_schema["$id"],
+            opaque_resource(meta_schema),
+        )
+        schema = {
+            "$defs": {
+                "other": {
+                    "$id": "https://example.com/other",
+                    "$schema": meta_schema["$id"],
+                    "companyKeyword": 9,
+                },
+            },
+            "$ref": "https://example.com/other",
+        }
+
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            self.vocabularies.prepare(
+                validators.Draft202012Validator,
+                registry=registry,
+            ).validate(9, schema)
+
+        self.register_vocabulary(meta_schemas={meta_schema["$id"]})
+        prepared = self.vocabularies.prepare(
+            validators.Draft202012Validator,
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid(9, schema))
+        self.assertFalse(prepared.is_valid(1, schema))
+
+    def test_preparation_does_not_pollute_global_state(self):
+        self.register_vocabulary(meta_schemas={self.META})
+        self.prepare()
+
+        self.assertNotIn(self.META, validators._META_SCHEMAS)
+        self.assertNotIn(
+            "companyKeyword",
+            validators.Draft202012Validator.VALIDATORS,
+        )
+        with self.assertWarns(DeprecationWarning):
+            validators.validator_for({"$schema": self.META})
+
+    def test_registries_are_independent(self):
+        self.register_vocabulary(meta_schemas={self.META})
+        prepared = self.prepare()
+
+        other = validators.VocabularyRegistry()
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            other.prepare(
+                validators.Draft202012Validator,
+                meta_schema=self.meta_schema,
+            )
+
+        prepared.validate("ok", {"companyKeyword": "ok"})
+
+    def test_composes_with_extend(self):
+        Extended = validators.extend(
+            validators.Draft202012Validator,
+            {"companyKeyword": company_keyword},
+        )
+        meta_schema = {
+            "$id": "https://example.com/meta/optional",
+            "$vocabulary": {self.VOCABULARY: False},
+        }
+        prepared = self.vocabularies.prepare(
+            Extended,
+            meta_schema=meta_schema,
+        )
+        self.assertTrue(prepared.is_valid("ok", {"companyKeyword": "ok"}))
+        self.assertFalse(prepared.is_valid("no", {"companyKeyword": "ok"}))
+
+    def test_prepared_dialect_is_reusable(self):
+        self.register_vocabulary(meta_schemas={self.META})
+        prepared = self.prepare()
+
+        self.assertTrue(prepared.is_valid(1, {"companyKeyword": 1}))
+        self.assertTrue(prepared.is_valid(2, {"companyKeyword": 2}))
+        self.assertFalse(prepared.is_valid(3, {"companyKeyword": 4}))
+        self.assertEqual(
+            prepared.validator_for({"companyKeyword": 1}),
+            prepared.validator,
+        )
+
+    def test_existing_validators_are_unaffected(self):
+        validator = validators.Draft202012Validator({"type": "integer"})
+        self.assertTrue(validator.is_valid(12))
+        self.assertFalse(validator.is_valid("12"))
+
+
 class TestValidationErrorMessages(TestCase):
     def message_for(self, instance, schema, *args, **kwargs):
         cls = kwargs.pop("cls", validators._LATEST_VERSION)

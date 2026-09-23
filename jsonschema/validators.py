@@ -600,6 +600,330 @@ def extend(
     )
 
 
+class VocabularyRegistry:
+    """
+    A registry of implementations for JSON Schema vocabularies.
+
+    Dialects (meta-schemas) declare the vocabularies they use via the
+    ``$vocabulary`` keyword, marking each one as required or optional.
+    A `VocabularyRegistry` lets an application explicitly declare which
+    vocabulary URIs it provides keyword implementations for, and then
+    *prepare* a dialect for strict validation -- ensuring every
+    vocabulary required by the dialect's meta-schema has a registered
+    implementation before any instance is validated.
+
+    Registries are independent of each other and of the globally
+    registered validators: preparing a dialect never mutates the global
+    state used by `validator_for`, nor any other registry, and existing
+    validator classes continue to behave as they always have when
+    constructed directly.
+
+    Example:
+
+        >>> def greet(validator, greeting, instance, schema):
+        ...     if instance != greeting:
+        ...         yield ValidationError(f"{instance!r} is no greeting")
+
+        >>> meta_schema = {
+        ...     "$id": "https://example.com/meta/greeting",
+        ...     "$vocabulary": {"https://example.com/vocab/greeting": True},
+        ... }
+        >>> vocabularies = jsonschema.validators.VocabularyRegistry()
+        >>> vocabularies.register(
+        ...     "https://example.com/vocab/greeting",
+        ...     keywords={"greeting": greet},
+        ...     meta_schemas={"https://example.com/meta/greeting"},
+        ... )
+        >>> prepared = vocabularies.prepare(
+        ...     Draft202012Validator,
+        ...     meta_schema=meta_schema,
+        ... )
+        >>> prepared.is_valid("hello", {"greeting": "hello"})
+        True
+        >>> prepared.is_valid("goodbye", {"greeting": "hello"})
+        False
+
+    """
+
+    def __init__(self):
+        self._vocabularies = {}
+
+    def register(self, uri, keywords, meta_schemas=()):
+        """
+        Register an implementation for the vocabulary with the given URI.
+
+        Arguments:
+
+            uri (str):
+
+                the exact URI of the vocabulary, as it appears in the
+                ``$vocabulary`` object of meta-schemas. Support is
+                determined solely by this explicit registration -- no
+                inference is made from parts of the URI.
+
+            keywords (collections.abc.Mapping):
+
+                a mapping from keyword names to validator callables, in
+                the same form accepted by `create`
+
+            meta_schemas (collections.abc.Iterable):
+
+                URIs of the meta-schemas (dialects) this implementation
+                applies to. If empty, the implementation applies to any
+                dialect which declares the vocabulary.
+
+        """
+        self._vocabularies[uri] = (dict(keywords), frozenset(meta_schemas))
+
+    def prepare(self, validator, meta_schema=None, registry=None):
+        """
+        Prepare a dialect for strict, vocabulary-checked validation.
+
+        The meta-schema's ``$vocabulary`` requirements are checked
+        immediately: any required vocabulary without a registered
+        implementation raises `jsonschema.exceptions.UnsupportedVocabulary`
+        before any instance is validated. Unknown vocabularies marked
+        optional (``false``) are ignored.
+
+        Keyword implementations registered here are merged into the
+        dialect's validator via `extend`, so this composes with the
+        existing extension path: extend a validator with your own
+        keywords first and prepare the result, or register vocabulary
+        keywords here and have them merged in automatically.
+
+        Arguments:
+
+            validator (jsonschema.protocols.Validator):
+
+                the validator class to prepare the dialect from. Any
+                class created by `create` or `extend` (including the
+                built-in draft validators) may be used.
+
+            meta_schema (collections.abc.Mapping):
+
+                the meta-schema defining the dialect. If unprovided,
+                the validator's own ``META_SCHEMA`` is used. Provide a
+                custom meta-schema to define a custom dialect.
+
+            registry (referencing.Registry):
+
+                a registry used to discover further meta-schemas by
+                their URI -- e.g. when validated schemas (or resources
+                they reference) declare a custom dialect via ``$schema``.
+                It is also passed along to validator instances created
+                from the prepared dialect.
+
+        Returns:
+
+            a reusable `PreparedDialect`
+
+        """
+        if meta_schema is None:
+            meta_schema = validator.META_SCHEMA
+        return PreparedDialect(
+            base_validator=validator,
+            meta_schema=meta_schema,
+            vocabularies=self,
+            registry=registry,
+        )
+
+
+class PreparedDialect:
+    """
+    A dialect whose required vocabularies have all been verified.
+
+    Instances are created by `VocabularyRegistry.prepare` -- see its
+    documentation for details. A prepared dialect may be reused to
+    validate any number of schemas and instances.
+
+    Each schema is handled under its own identity: boolean schemas use
+    the prepared dialect itself, while schemas (including nested
+    resources) carrying their own ``$schema`` are validated with a
+    validator specific to that dialect: its required vocabularies are
+    checked, and its registered keywords applied, before the first
+    instance keyword is evaluated. Meta-schemas for such dialects are
+    discovered via the globally known meta-schemas or the
+    `referencing.Registry` provided at preparation time.
+    """
+
+    def __init__(self, base_validator, meta_schema, vocabularies, registry):
+        self._base_validator = base_validator
+        self._base_vocabularies = frozenset(
+            base_validator.META_SCHEMA.get("$vocabulary", {}),
+        )
+        self._vocabularies = vocabularies
+        self._registry = registry
+        self._checked = set()
+        self._classes = {}
+
+        if isinstance(meta_schema, Mapping):
+            self._dialect = base_validator.ID_OF(meta_schema)
+        else:
+            self._dialect = None
+        self._validator = self._class_for(self._dialect, meta_schema)
+        self._check(meta_schema, self._dialect)
+
+    @property
+    def validator(self):
+        """
+        The prepared validator class for this dialect.
+        """
+        return self._validator
+
+    def validator_for(self, schema=True):
+        """
+        Return the prepared validator class appropriate for the schema.
+
+        The schema's own ``$schema`` (if any) is checked for unsupported
+        required vocabularies before the class is returned.
+        """
+        self._check_for_schema(schema, None)
+        return self._evolve_target(schema, self._validator)
+
+    def __call__(self, schema=True, **kwargs):
+        """
+        Create a validator instance for the schema under this dialect.
+        """
+        registry = kwargs.get("registry")
+        self._check_for_schema(schema, registry)
+        if registry is None and self._registry is not None:
+            kwargs["registry"] = self._registry
+        cls = self._evolve_target(schema, self._validator)
+        return cls(schema, **kwargs)
+
+    def validate(self, instance, schema=True, **kwargs):
+        """
+        Validate the instance under the schema, as this dialect.
+        """
+        self(schema, **kwargs).validate(instance)
+
+    def iter_errors(self, instance, schema=True, **kwargs):
+        """
+        Lazily yield each validation error for the instance.
+        """
+        return self(schema, **kwargs).iter_errors(instance)
+
+    def is_valid(self, instance, schema=True, **kwargs):
+        """
+        Return whether the instance is valid under the schema.
+        """
+        return self(schema, **kwargs).is_valid(instance)
+
+    def _keywords_for(self, dialect):
+        keywords = {}
+        for each, meta_schemas in self._vocabularies._vocabularies.values():
+            if not meta_schemas or dialect in meta_schemas:
+                keywords.update(each)
+        return keywords
+
+    def _class_for(self, dialect, meta_schema):
+        cls = self._classes.get(dialect)
+        if cls is None:
+            cls = extend(self._base_validator, self._keywords_for(dialect))
+            if isinstance(meta_schema, Mapping):
+                cls.META_SCHEMA = dict(meta_schema)
+            self._attach(cls)
+            self._classes[dialect] = cls
+        return cls
+
+    def _attach(self, cls):
+        post_init = cls.__attrs_post_init__
+
+        def checked_post_init(instance):
+            post_init(instance)
+            self._check_for_schema(instance.schema, instance._registry)
+
+        cls.__attrs_post_init__ = checked_post_init
+
+        base_evolve = cls.evolve
+
+        def evolve(instance, **changes):
+            target = self._evolve_target(
+                changes.get("schema", instance.schema),
+                type(instance),
+            )
+            if target is type(instance):
+                return base_evolve(instance, **changes)
+            changes.setdefault("schema", instance.schema)
+            for each in fields(type(instance)):
+                if not each.init:
+                    continue
+                if each.alias not in changes:
+                    changes[each.alias] = getattr(instance, each.name)
+            return target(**changes)
+
+        cls.evolve = evolve
+
+    def _evolve_target(self, schema, current):
+        if not isinstance(schema, Mapping):
+            return current
+        dialect = schema.get("$schema")
+        if (
+            not isinstance(dialect, str)
+            or not dialect
+            or dialect in _META_SCHEMAS
+        ):
+            return current
+        meta_schema = self._known_meta_schema(dialect, None)
+        if meta_schema is None:
+            return current
+        return self._class_for(dialect, meta_schema)
+
+    def _check_for_schema(self, schema, registry):
+        if not isinstance(schema, Mapping):
+            return
+        dialect = schema.get("$schema")
+        if (
+            not isinstance(dialect, str)
+            or not dialect
+            or dialect == self._dialect
+            or dialect in self._checked
+        ):
+            return
+        meta_schema = self._known_meta_schema(dialect, registry)
+        if meta_schema is not None:
+            self._check(meta_schema, dialect)
+
+    def _known_meta_schema(self, dialect, registry):
+        if dialect == self._dialect:
+            return self._validator.META_SCHEMA
+        known = _META_SCHEMAS.get(dialect)
+        if known is not None:
+            return known.META_SCHEMA
+        if registry is None or registry is _REMOTE_WARNING_REGISTRY:
+            registry = self._registry
+        if registry is None:
+            return None
+        try:
+            return registry.contents(dialect)
+        except referencing.exceptions.NoSuchResource:
+            return None
+
+    def _check(self, meta_schema, uri):
+        if uri in self._checked or not isinstance(meta_schema, Mapping):
+            return
+        declared = meta_schema.get("$vocabulary", {})
+        unsupported = [
+            vocabulary
+            for vocabulary, required in declared.items()
+            if required and not self._is_implemented(vocabulary, uri)
+        ]
+        if unsupported:
+            raise exceptions.UnsupportedVocabulary(
+                vocabularies=unsupported,
+                uri=uri,
+            )
+        self._checked.add(uri)
+
+    def _is_implemented(self, vocabulary, dialect):
+        registered = self._vocabularies._vocabularies.get(vocabulary)
+        if registered is not None:
+            _, meta_schemas = registered
+            if not meta_schemas or dialect in meta_schemas:
+                return True
+        return vocabulary in self._base_vocabularies
+
+
 Draft3Validator = create(
     meta_schema=SPECIFICATIONS.contents(
         "http://json-schema.org/draft-03/schema#",

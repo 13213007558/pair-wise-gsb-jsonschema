@@ -1,6 +1,12 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.validators.VocabularyRegistry``, a strict dialect
+  preparation entry point which verifies that all vocabularies marked
+  required by a meta-schema's ``$vocabulary`` declaration have
+  explicitly registered implementations before any instance is
+  validated, raising ``jsonschema.exceptions.UnsupportedVocabulary``
+  otherwise.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
   ``relevance`` no longer considers an error's position amongst its siblings.
