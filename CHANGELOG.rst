@@ -1,6 +1,7 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.evaluation``, an explicit evaluation entry point for Draft 2020-12 which returns a JSON-serializable result tree recording each evaluation location (instance and schema, including across ``$ref`` / ``$dynamicRef``), its validity, and effective annotations such as evaluated properties and items.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
   ``relevance`` no longer considers an error's position amongst its siblings.
