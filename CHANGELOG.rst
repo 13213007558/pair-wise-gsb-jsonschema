@@ -1,3 +1,15 @@
+v4.25.2
+=======
+
+* Fix resolution scope leaks in the deprecated ``RefResolver``-based
+  reference handling: scopes pushed while following references during one
+  validation call no longer remain on the resolver's shared scope stack
+  after the call ends.
+  Each validation call (including ones raising errors, and ones made by
+  other validators sharing a resolver) now starts from the same resolution
+  scope as when the validator was created, instead of inheriting scopes
+  left behind by previous traversals.
+
 v4.25.1
 =======
 

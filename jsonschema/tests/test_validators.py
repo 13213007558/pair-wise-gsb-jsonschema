@@ -2305,6 +2305,268 @@ class TestReferencing(TestCase):
         self.assertFalse(w)
 
 
+class TestValidationCallIsolation(TestCase):
+    """
+    Each validation call gets an independent dynamic reference stack.
+
+    Validators (and registries, and deprecated ref resolvers) may be
+    reused across calls, but call-level resolution state must neither
+    leak into later calls nor be shared with concurrently running ones.
+    """
+
+    def test_dynamic_scope_does_not_leak_between_interleaved_tenants(self):
+        tree = {
+            "$id": "https://example.com/tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "properties": {
+                "data": True,
+                "children": {
+                    "type": "array",
+                    "items": {"$dynamicRef": "#node"},
+                },
+            },
+        }
+        strict = {
+            "$id": "https://example.com/strict",
+            "$dynamicAnchor": "node",
+            "$ref": "tree",
+            "unevaluatedProperties": False,
+        }
+        lax = {
+            "$id": "https://example.com/lax",
+            "$dynamicAnchor": "node",
+            "$ref": "tree",
+        }
+        registry = referencing.Registry().with_resources(
+            [
+                (each["$id"], DRAFT202012.create_resource(each))
+                for each in [tree, strict, lax]
+            ],
+        )
+        tenant_a = validators.Draft202012Validator(strict, registry=registry)
+        tenant_b = validators.Draft202012Validator(lax, registry=registry)
+
+        valid = {"data": 1, "children": [{"data": 2}]}
+        extra_property = {"data": 1, "hah": "not allowed for tenant A"}
+
+        for _ in range(10):
+            self.assertTrue(tenant_a.is_valid(valid))
+            self.assertFalse(tenant_a.is_valid(extra_property))
+            self.assertTrue(tenant_b.is_valid(valid))
+            self.assertTrue(tenant_b.is_valid(extra_property))
+
+        # The validator's own resolver is untouched by the calls above --
+        # its dynamic scope is still the empty one it was constructed with.
+        self.assertEqual(list(tenant_a._resolver.dynamic_scope()), [])
+        self.assertEqual(list(tenant_b._resolver.dynamic_scope()), [])
+
+    def test_repeated_validation_produces_identical_dynamic_errors(self):
+        schema = {
+            "$id": "https://example.com/root",
+            "$ref": "list",
+            "$defs": {
+                "foo": {"$dynamicAnchor": "items", "type": "string"},
+                "list": {
+                    "$id": "list",
+                    "type": "array",
+                    "items": {"$dynamicRef": "#items"},
+                    "$defs": {"items": {"$dynamicAnchor": "items"}},
+                },
+            },
+        }
+        validator = validators.Draft202012Validator(schema)
+
+        first, = validator.iter_errors([12])
+        second, = validator.iter_errors([12])
+
+        # The error points at the actual dynamic target (the outermost
+        # $dynamicAnchor still in scope), identically on every call.
+        self.assertEqual(
+            first.schema,
+            {"$dynamicAnchor": "items", "type": "string"},
+        )
+        self.assertEqual(first.validator, "type")
+        self.assertEqual(
+            list(first.absolute_schema_path),
+            ["items", "$dynamicRef", "type"],
+        )
+        self.assertEqual(first.message, second.message)
+        self.assertEqual(
+            list(first.absolute_schema_path),
+            list(second.absolute_schema_path),
+        )
+
+    def test_check_schema_does_not_pollute_later_validation(self):
+        schema = {
+            "$id": "https://example.com/root",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "properties": {"child": {"$dynamicRef": "#node"}},
+        }
+        validators.Draft202012Validator.check_schema(schema)
+        validator = validators.Draft202012Validator(schema)
+        self.assertTrue(validator.is_valid({"child": {}}))
+        self.assertFalse(validator.is_valid({"child": 12}))
+
+    def test_concurrent_validation_shares_no_call_state(self):
+        from threading import Thread
+
+        schema = {
+            "$id": "https://example.com/root",
+            "$ref": "list",
+            "$defs": {
+                "foo": {"$dynamicAnchor": "items", "type": "string"},
+                "list": {
+                    "$id": "list",
+                    "type": "array",
+                    "items": {"$dynamicRef": "#items"},
+                    "$defs": {"items": {"$dynamicAnchor": "items"}},
+                },
+            },
+        }
+        validator = validators.Draft202012Validator(schema)
+
+        failures = []
+
+        def work(instance, expected):
+            try:
+                for _ in range(100):
+                    if validator.is_valid(instance) is not expected:
+                        failures.append((instance, expected))
+            except Exception as e:  # pragma: no cover
+                failures.append(e)
+
+        threads = [
+            Thread(target=work, args=(["ok"], True)),
+            Thread(target=work, args=([12], False)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+
+    def test_validation_wrapped_in_asyncio_tasks(self):
+        import asyncio
+
+        schema = {
+            "$id": "https://example.com/root",
+            "$ref": "list",
+            "$defs": {
+                "foo": {"$dynamicAnchor": "items", "type": "string"},
+                "list": {
+                    "$id": "list",
+                    "type": "array",
+                    "items": {"$dynamicRef": "#items"},
+                    "$defs": {"items": {"$dynamicAnchor": "items"}},
+                },
+            },
+        }
+        validator = validators.Draft202012Validator(schema)
+
+        async def check():
+            return await asyncio.gather(
+                asyncio.to_thread(validator.is_valid, ["ok"]),
+                asyncio.to_thread(validator.is_valid, [12]),
+                asyncio.to_thread(validator.is_valid, ["ok", "still ok"]),
+            )
+
+        self.assertEqual(asyncio.run(check()), [True, False, True])
+
+    def test_reference_cycles_terminate_and_validation_recovers(self):
+        validator = validators.Draft202012Validator(
+            {"$id": "https://example.com/loop", "$ref": "#"},
+        )
+        with self.assertRaises(RecursionError):
+            validator.validate(12)
+        # Validators are still usable afterwards.
+        self.assertTrue(
+            validators.Draft202012Validator({"type": "integer"}).is_valid(12),
+        )
+
+    def test_legacy_resolver_scopes_do_not_leak_between_calls(self):
+        child = {"$id": "https://example.com/child/", "type": "integer"}
+        schema = {
+            "$id": "https://example.com/root",
+            "properties": {"x": {"$ref": "https://example.com/child"}},
+        }
+        resolver = validators._RefResolver(
+            "",
+            {},
+            store={"https://example.com/child": child},
+        )
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        before = list(resolver._scopes_stack)
+        for _ in range(3):
+            self.assertTrue(validator.is_valid({"x": 12}))
+            self.assertFalse(validator.is_valid({"x": "no"}))
+            self.assertEqual(list(resolver._scopes_stack), before)
+
+    def test_legacy_resolver_scopes_are_call_local_across_tenants(self):
+        child = {"$id": "https://example.com/nested/child", "type": "integer"}
+        thing = {"type": "string"}
+        store = {
+            "https://example.com/nested/child": child,
+            "https://example.com/thing": thing,
+        }
+        schema = {
+            "$id": "https://example.com/root",
+            "properties": {
+                "x": {"$ref": "https://example.com/nested/child"},
+                "y": {"$ref": "thing"},
+            },
+        }
+        resolver = validators._RefResolver("", {}, store=store)
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        # If scopes from following the child $ref leaked, "thing" would
+        # resolve against the nested resource instead of the root one.
+        for _ in range(3):
+            self.assertTrue(validator.is_valid({"x": 1, "y": "ok"}))
+            self.assertFalse(validator.is_valid({"x": 1, "y": 2}))
+
+    def test_legacy_resolver_scopes_are_released_on_error(self):
+        child = {"$id": "https://example.com/child/", "type": "integer"}
+        schema = {
+            "$id": "https://example.com/root",
+            "properties": {
+                "x": {"$ref": "https://example.com/child"},
+                "y": {"$ref": "https://example.com/missing"},
+            },
+        }
+        resolver = validators._RefResolver(
+            "",
+            {},
+            store={"https://example.com/child": child},
+        )
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        before = list(resolver._scopes_stack)
+        with self.assertRaises(exceptions._RefResolutionError):
+            validator.validate({"x": 1, "y": 2})
+        self.assertEqual(list(resolver._scopes_stack), before)
+
+    def test_legacy_resolver_scopes_are_released_when_raising(self):
+        child = {"$id": "https://example.com/child/", "type": "integer"}
+        schema = {
+            "$id": "https://example.com/root",
+            "properties": {"x": {"$ref": "https://example.com/child"}},
+        }
+        resolver = validators._RefResolver(
+            "",
+            {},
+            store={"https://example.com/child": child},
+        )
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+
+        before = list(resolver._scopes_stack)
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"x": "not an integer"})
+        self.assertEqual(list(resolver._scopes_stack), before)
+
+
 class TestRefResolver(TestCase):
 
     base_uri = ""

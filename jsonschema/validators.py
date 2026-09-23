@@ -348,6 +348,32 @@ def create(
             return NewValidator(**changes)
 
         def iter_errors(self, instance, _schema=None):
+            # REMOVEME: Legacy ref resolution state management.
+            #
+            # The deprecated ref resolver keeps its resolution scopes in a
+            # mutable stack which is shared by every validator (and every
+            # validation call) using it. Scopes pushed while this call runs
+            # are call-local state, so the stack is restored to its incoming
+            # state once the call finishes (or is closed), keeping each
+            # validation call's dynamic reference stack isolated from any
+            # other -- including calls made before or after this one, and
+            # calls made by other validators sharing the resolver.
+            if self._ref_resolver is not None:
+                stack = getattr(self._ref_resolver, "_scopes_stack", None)
+            else:
+                stack = None
+
+            if stack is None:
+                yield from self._iter_errors(instance, _schema)
+                return
+
+            depth = len(stack)
+            try:
+                yield from self._iter_errors(instance, _schema)
+            finally:
+                del stack[depth:]
+
+        def _iter_errors(self, instance, _schema=None):
             if _schema is not None:
                 warnings.warn(
                     (
@@ -357,7 +383,7 @@ def create(
                         "iter_errors(...) instead."
                     ),
                     DeprecationWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
                 validators = [
                     (self.VALIDATORS[k], k, v)
@@ -447,8 +473,15 @@ def create(
                     yield error
 
         def validate(self, *args, **kwargs):
-            for error in self.iter_errors(*args, **kwargs):
-                raise error
+            errors = self.iter_errors(*args, **kwargs)
+            try:
+                for error in errors:
+                    raise error
+            finally:
+                # Ensure any call-local state (e.g. legacy resolution
+                # scopes) is released deterministically, even when raising
+                # the first error mid-iteration.
+                errors.close()
 
         def is_type(self, instance, type):
             try:
@@ -476,12 +509,24 @@ def create(
                         return self.descend(instance, resolved)
                 else:
                     scope, resolved = resolve(ref)
+                    stack = getattr(self._ref_resolver, "_scopes_stack", None)
+                    depth = None if stack is None else len(stack)
                     self._ref_resolver.push_scope(scope)
 
                     try:
                         return list(self.descend(instance, resolved))
                     finally:
-                        self._ref_resolver.pop_scope()
+                        if depth is None:
+                            self._ref_resolver.pop_scope()
+                        else:
+                            # REMOVEME: Legacy ref resolution state
+                            # management. Restore the stack to the scopes
+                            # present before this reference was followed --
+                            # descending may have pushed further scopes (for
+                            # subresources with their own IDs) which are
+                            # local to this reference's traversal and must
+                            # not leak into sibling or later resolutions.
+                            del stack[depth:]
 
         def is_valid(self, instance, _schema=None):
             if _schema is not None:
@@ -497,7 +542,11 @@ def create(
                 )
                 self = self.evolve(schema=_schema)
 
-            error = next(self.iter_errors(instance), None)
+            errors = self.iter_errors(instance)
+            try:
+                error = next(errors, None)
+            finally:
+                errors.close()
             return error is None
 
     evolve_fields = [
