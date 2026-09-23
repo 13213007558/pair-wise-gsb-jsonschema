@@ -12,6 +12,7 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
+from jsonschema.bundling import SchemaBundle
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import (
     Draft3Validator,
@@ -113,6 +114,7 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "SchemaBundle",
     "SchemaError",
     "TypeChecker",
     "ValidationError",

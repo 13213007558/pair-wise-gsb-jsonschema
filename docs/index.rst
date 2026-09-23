@@ -13,6 +13,7 @@ Contents
     validate
     errors
     referencing
+    bundling
     creating
     faq
     api/index
