@@ -1,3 +1,11 @@
+v4.25.2
+=======
+
+* Fix evaluation tracking for draft 2019-09 ``unevaluatedProperties`` and ``unevaluatedItems``.
+  Properties and items evaluated via ``additionalProperties``, boolean or tuple ``items``, ``$recursiveRef``,
+  ``if`` / ``then`` / ``else`` and successful ``allOf`` / ``anyOf`` / ``oneOf`` branches are now correctly
+  considered evaluated, and failed branches no longer leak or lose evaluation marks.
+
 v4.25.1
 =======
 

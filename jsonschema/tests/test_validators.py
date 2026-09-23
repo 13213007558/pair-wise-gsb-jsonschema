@@ -1993,6 +1993,121 @@ class TestDraft202012Validator(ValidatorTestMixin, TestCase):
     invalid = {"type": "integer"}, "foo"
 
 
+class TestUnevaluatedEvaluationTracking(TestCase):
+    """
+    Regression tests for how evaluated properties/items are tracked and merged.
+    """
+
+    def test_additionalProperties_marks_keys_evaluated(self):
+        schema = {
+            "additionalProperties": {"type": "string"},
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"foo": "bar"})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": 12})
+
+    def test_nested_unevaluatedProperties_marks_keys_evaluated(self):
+        schema = {"unevaluatedProperties": {"type": "string"}}
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"foo": "bar"})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": 12})
+
+    def test_boolean_items_do_not_crash_unevaluatedItems(self):
+        validators.Draft201909Validator(
+            {"items": True, "unevaluatedItems": False},
+        ).validate([1, 2])
+        validators.Draft201909Validator(
+            {"items": False, "unevaluatedItems": False},
+        ).validate([])
+
+    def test_recursiveRef_marks_keys_evaluated(self):
+        schema = {
+            "$id": "https://example.com/root",
+            "$recursiveAnchor": True,
+            "properties": {"foo": {"$recursiveRef": "#"}},
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"foo": {"foo": {}}})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": {"bar": {}}})
+
+    def test_if_then_else_marks_follow_the_taken_branch(self):
+        schema = {
+            "properties": {"kind": True},
+            "if": {"properties": {"kind": {"const": "a"}}},
+            "then": {"properties": {"x": True}},
+            "else": {"properties": {"y": True}},
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"kind": "a", "x": 1})
+        validator.validate({"kind": "b", "y": 1})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"kind": "a", "y": 1})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"kind": "b", "x": 1})
+
+    def test_anyOf_failed_branch_does_not_mark_keys_evaluated(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"foo": {"const": 1}}, "required": ["missing"]},
+                {"properties": {"foo": {"const": 1}}},
+            ],
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"foo": 1})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": 1, "bar": 2})
+
+    def test_oneOf_successful_branch_marks_keys_evaluated(self):
+        schema = {
+            "oneOf": [
+                {"properties": {"foo": {"type": "string"}},
+                 "required": ["foo"]},
+                {"properties": {"bar": {"type": "integer"}},
+                 "required": ["bar"]},
+            ],
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        validator.validate({"foo": "a"})
+        validator.validate({"bar": 1})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": "a", "baz": 1})
+
+    def test_dynamicRef_marks_keys_evaluated(self):
+        schema = {
+            "$id": "https://example.com/root",
+            "$ref": "other",
+            "$defs": {"other": {"$id": "other", "properties": {"foo": True}}},
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft202012Validator(schema)
+        validator.validate({"foo": 1})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"bar": 1})
+
+    def test_repeated_validation_leaves_no_residual_evaluation_state(self):
+        schema = {
+            "properties": {"kind": True},
+            "if": {"properties": {"kind": {"const": "a"}}},
+            "then": {"properties": {"x": True}},
+            "else": {"properties": {"y": True}},
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        for _ in range(3):
+            self.assertTrue(validator.is_valid({"kind": "b", "y": 1}))
+            self.assertFalse(validator.is_valid({"kind": "b", "x": 1}))
+            self.assertTrue(validator.is_valid({"kind": "a", "x": 1}))
+            self.assertFalse(validator.is_valid({"kind": "a", "y": 1}))
+
+
 class TestLatestValidator(TestCase):
     """
     These really apply to multiple versions but are easiest to test on one.

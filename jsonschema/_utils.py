@@ -3,6 +3,8 @@ from urllib.parse import urlsplit
 import itertools
 import re
 
+from referencing.jsonschema import lookup_recursive_ref
+
 
 class URIDict(MutableMapping):
     """
@@ -192,12 +194,22 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
         return []
     evaluated_indexes = []
 
-    if "items" in schema:
-        return list(range(len(instance)))
-
     ref = schema.get("$ref")
     if ref is not None:
         resolved = validator._resolver.lookup(ref)
+        evaluated_indexes.extend(
+            find_evaluated_item_indexes_by_schema(
+                validator.evolve(
+                    schema=resolved.contents,
+                    _resolver=resolved.resolver,
+                ),
+                instance,
+                resolved.contents,
+            ),
+        )
+
+    if "$recursiveRef" in schema:
+        resolved = lookup_recursive_ref(validator._resolver)
         evaluated_indexes.extend(
             find_evaluated_item_indexes_by_schema(
                 validator.evolve(
@@ -222,6 +234,18 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
                 resolved.contents,
             ),
         )
+
+    if "items" in schema:
+        items = schema["items"]
+        if "additionalItems" in schema:
+            return list(range(len(instance)))
+        if validator.is_type(items, "object"):
+            return list(range(len(instance)))
+        if validator.is_type(items, "boolean"):
+            if items:
+                return list(range(len(instance)))
+        else:
+            evaluated_indexes += list(range(len(items)))
 
     if "prefixItems" in schema:
         evaluated_indexes += list(range(len(schema["prefixItems"])))
@@ -273,6 +297,19 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
     ref = schema.get("$ref")
     if ref is not None:
         resolved = validator._resolver.lookup(ref)
+        evaluated_keys.extend(
+            find_evaluated_property_keys_by_schema(
+                validator.evolve(
+                    schema=resolved.contents,
+                    _resolver=resolved.resolver,
+                ),
+                instance,
+                resolved.contents,
+            ),
+        )
+
+    if "$recursiveRef" in schema:
+        resolved = lookup_recursive_ref(validator._resolver)
         evaluated_keys.extend(
             find_evaluated_property_keys_by_schema(
                 validator.evolve(
