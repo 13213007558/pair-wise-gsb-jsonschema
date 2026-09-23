@@ -1,6 +1,19 @@
 v4.27.0
 =======
 
+* Add an opt-in ``jsonschema.content`` module:
+  ``jsonschema.content.extend_with_content_validation`` extends any
+  validator class so that strings carrying ``contentEncoding: base64``,
+  ``contentMediaType: application/json`` and ``contentSchema`` have
+  their decoded content validated against the content schema.
+  Decoding is strict (no arbitrary encodings, no lossy UTF-8 replacement,
+  duplicate JSON keys are rejected) and bounded by configurable decode
+  depth and decoded-byte budgets, and content errors are distinguishable
+  from ordinary ones via the ``jsonschema.content.ContentError``
+  subclass of ``ValidationError``.
+  Without the extension, the ``content*`` keywords keep their default
+  annotation-only behavior.
+
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
   ``relevance`` no longer considers an error's position amongst its siblings.
