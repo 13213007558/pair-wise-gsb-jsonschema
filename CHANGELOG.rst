@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+* Add ``jsonschema.exceptions.RelevanceStrategy``, a configurable,
+  totally-ordered error relevance ranking with an explainable tie-break
+  table (instance path, schema path, validator priority, context depth
+  and custom validator weights), plus strategy-aware serialization via
+  ``RelevanceStrategy.to_dict``. ``best_match`` now accepts a
+  ``strategy`` argument, and ``relevance`` no longer raises
+  ``TypeError`` when comparing paths that mix property names with array
+  indices.
+
 v4.25.1
 =======
 

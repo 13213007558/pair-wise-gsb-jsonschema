@@ -11,7 +11,7 @@ import heapq
 import re
 import warnings
 
-from attrs import define
+from attrs import define, field
 from referencing.exceptions import Unresolvable as _Unresolvable
 
 from jsonschema import _utils
@@ -27,6 +27,43 @@ STRONG_MATCHES: frozenset[str] = frozenset()
 _JSON_PATH_COMPATIBLE_PROPERTY_PATTERN = re.compile("^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _unset = _utils.Unset()
+
+
+def _comparable_path(path: Iterable[str | int]) -> tuple:
+    """
+    Return a totally-ordered representation of an instance or schema path.
+
+    Paths may freely mix strings (property names, including non-ASCII
+    ones) with integers (array indices), which cannot be compared
+    directly with each other. Each element is tagged so that strings
+    order before integers, making the result deterministic no matter
+    what element types are involved.
+    """
+    return tuple(
+        (0, element) if isinstance(element, str) else (1, element)
+        for element in path
+    )
+
+
+def _context_depth(error: _Error) -> int:
+    """
+    Return the number of ancestors an error has within its context tree.
+    """
+    depth = 0
+    parent = error.parent
+    while parent is not None:
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
+def _jsonable(value: Any) -> Any:
+    """
+    Convert a relevance key component into a JSON-serializable value.
+    """
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(element) for element in value]
+    return value
 
 
 def _pretty(thing: Any, prefix: str):
@@ -416,7 +453,7 @@ def by_relevance(weak=WEAK_MATCHES, strong=STRONG_MATCHES):
         validator = error.validator
         return (                        # prefer errors which are ...
             -len(error.path),           # 'deeper' and thereby more specific
-            error.path,                 # earlier (for sibling errors)
+            _comparable_path(error.path),  # earlier (for sibling errors)
             validator not in weak,      # for a non-low-priority keyword
             validator in strong,        # for a high priority keyword
             not error._matches_type(),  # at least match the instance's type
@@ -437,7 +474,226 @@ Example:
 """
 
 
-def best_match(errors, key=relevance):
+def _validator_rank(strategy, error) -> float:
+    """
+    Return the priority rank of an error's validator within a strategy.
+
+    Custom weights win; otherwise strong validators outrank normal ones,
+    which outrank weak ones.
+    """
+    name = error.validator
+    if not isinstance(name, str):
+        return 0.0
+    if name in strategy.validator_weights:
+        return float(strategy.validator_weights[name])
+    return 1.0 + (name in strategy.strong) - (name in strategy.weak)
+
+
+#: The available tie-breaker components, as ``name: (strategy, error) ->
+#: value`` functions. Larger component values are considered more relevant.
+#: See `RelevanceStrategy` for the meaning of each component.
+_TIE_BREAKER_COMPONENTS = {
+    "path_depth": lambda strategy, error: (
+        -strategy.path_weight * len(error.absolute_path)
+    ),
+    "path": lambda strategy, error: _comparable_path(error.absolute_path),
+    "validator": _validator_rank,
+    "type_match": lambda strategy, error: not error._matches_type(),
+    "depth": lambda strategy, error: (
+        -strategy.depth_weight * _context_depth(error)
+    ),
+    "schema_path_depth": lambda strategy, error: (
+        -strategy.schema_path_weight * len(error.absolute_schema_path)
+    ),
+    "schema_path": lambda strategy, error: _comparable_path(
+        error.absolute_schema_path,
+    ),
+    "validator_name": lambda strategy, error: (
+        error.validator if isinstance(error.validator, str) else ""
+    ),
+}
+
+#: The default order in which tie-breakers are applied. See
+#: `RelevanceStrategy` for a description of each entry.
+DEFAULT_TIE_BREAKERS: tuple[str, ...] = (
+    "path_depth",
+    "path",
+    "validator",
+    "type_match",
+    "depth",
+    "schema_path_depth",
+    "schema_path",
+    "validator_name",
+)
+
+
+@define(frozen=True)
+class RelevanceStrategy:
+    """
+    A configurable, totally-ordered strategy for sorting validation errors.
+
+    A strategy turns each `ValidationError` into a key tuple built from
+    the components listed in ``tie_breakers``, applied in order. Larger
+    keys are considered *more* relevant (so `max` picks the best match
+    and `RelevanceStrategy.sort` returns the most relevant error first).
+
+    The available tie-breaker components are:
+
+    =====================  =================================================
+    Name                   Prefers (by default) ...
+    =====================  =================================================
+    ``path_depth``         shallower instance paths, scaled by
+                           ``path_weight`` (a negative weight prefers
+                           deeper, more specific paths instead)
+    ``path``               instance path elements, compared
+                           lexicographically, with strings (property
+                           names, including non-ASCII ones) ordering
+                           before integers (array indices)
+    ``validator``          validators with a higher priority rank: a
+                           custom ``validator_weights`` entry if present,
+                           otherwise strong (2) > normal (1) > weak (0)
+    ``type_match``         errors whose schema ``type`` does not match
+                           the instance's type
+    ``depth``              shallower errors within the ``context`` tree,
+                           scaled by ``depth_weight``
+    ``schema_path_depth``  shallower schema paths, scaled by
+                           ``schema_path_weight``
+    ``schema_path``        schema path elements, compared like ``path``
+    ``validator_name``     the validator's keyword name, as a final
+                           deterministic tie-break
+    =====================  =================================================
+
+    If two errors compare equal on every configured component, the
+    relative order of the input iterable is preserved (sorting is
+    stable), so results remain deterministic for a given input order.
+
+    Keys are computed purely from each error's structured attributes
+    (paths, validator, context tree) -- never from message strings --
+    and no error (nor its ``context``) is mutated, merged or dropped,
+    so the same strategy may safely be shared across threads.
+
+    Arguments:
+        weak (frozenset[str]):
+            validation keywords to consider low priority. Defaults to
+            :kw:`anyOf` and :kw:`oneOf`.
+        strong (frozenset[str]):
+            validation keywords to consider high priority.
+        validator_weights (collections.abc.Mapping[str, float]):
+            custom per-keyword priority weights. Any keyword present
+            here uses its weight as its rank, overriding ``weak`` and
+            ``strong``.
+        path_weight (float):
+            scale applied to the instance path depth component.
+        schema_path_weight (float):
+            scale applied to the schema path depth component.
+        depth_weight (float):
+            scale applied to the context-tree depth component.
+        tie_breakers (tuple[str, ...]):
+            the ordered names of the components making up each key.
+            Reorder or trim this tuple to change the tie-break table.
+    """
+
+    weak: frozenset[str] = WEAK_MATCHES
+    strong: frozenset[str] = STRONG_MATCHES
+    validator_weights: Mapping[str, float] = field(factory=dict)
+    path_weight: float = 1.0
+    schema_path_weight: float = 1.0
+    depth_weight: float = 1.0
+    tie_breakers: tuple[str, ...] = DEFAULT_TIE_BREAKERS
+
+    def __attrs_post_init__(self):
+        unknown = set(self.tie_breakers) - set(_TIE_BREAKER_COMPONENTS)
+        if unknown:
+            raise ValueError(
+                "Unknown relevance tie-breaker(s): "
+                + ", ".join(sorted(unknown))
+                + ". Known tie-breakers: "
+                + ", ".join(_TIE_BREAKER_COMPONENTS)
+                + ".",
+            )
+
+    def key(self, error: ValidationError) -> tuple:
+        """
+        Return this strategy's relevance key for the given error.
+
+        The key is a tuple with one component per entry in
+        ``tie_breakers``. Larger keys indicate more relevant errors.
+        """
+        return tuple(
+            _TIE_BREAKER_COMPONENTS[name](self, error)
+            for name in self.tie_breakers
+        )
+
+    def explain(self, error: ValidationError) -> list:
+        """
+        Return the tie-break table for an error.
+
+        The result is a list of ``(component name, value)`` pairs, in
+        the order the components are applied, explaining exactly why
+        the error ranks where it does under this strategy.
+        """
+        return [
+            (name, _TIE_BREAKER_COMPONENTS[name](self, error))
+            for name in self.tie_breakers
+        ]
+
+    def sort(self, errors: Iterable[ValidationError]) -> list:
+        """
+        Return the errors sorted from most to least relevant.
+
+        Sorting is stable and never mutates, merges or drops errors,
+        so every branch of an :kw:`anyOf` / :kw:`oneOf` /
+        :kw:`dependentSchemas` / :kw:`$ref` context tree is preserved.
+        """
+        return sorted(errors, key=self.key, reverse=True)
+
+    def best_match(self, errors: Iterable[ValidationError]):
+        """
+        Return the best matching error under this strategy.
+
+        Equivalent to ``best_match(errors, key=strategy.key)``.
+        """
+        return best_match(errors, key=self.key)
+
+    def to_dict(self, error: ValidationError, include_context=True) -> dict:
+        """
+        Serialize an error, and optionally its full context tree.
+
+        The result is a JSON-compatible mapping containing the error's
+        message, validator, instance and schema paths, ``json_path``,
+        depth within the context tree, cause, and this strategy's
+        relevance for the error (keyed by tie-breaker name). Context
+        children are serialized recursively in their original order --
+        the tree is neither reordered nor deduplicated.
+        """
+        result = {
+            "message": error.message,
+            "validator": (
+                error.validator if isinstance(error.validator, str) else None
+            ),
+            "path": list(error.absolute_path),
+            "schema_path": list(error.absolute_schema_path),
+            "json_path": error.json_path,
+            "depth": _context_depth(error),
+            "relevance": {
+                name: _jsonable(value) for name, value in self.explain(error)
+            },
+            "cause": None if error.cause is None else str(error.cause),
+        }
+        if include_context:
+            result["context"] = [
+                self.to_dict(child) for child in error.context
+            ]
+        return result
+
+
+DEFAULT_STRATEGY = RelevanceStrategy()
+"""
+A `RelevanceStrategy` with the default tie-break table and weights.
+"""
+
+
+def best_match(errors, key=None, strategy=None):
     """
     Try to find an error that appears to be the best match among given errors.
 
@@ -467,6 +723,12 @@ def best_match(errors, key=relevance):
             that rates errors but still want the error context descent
             done by this function.
 
+        strategy (RelevanceStrategy):
+
+            a relevance strategy to sort errors with. Shorthand for
+            passing ``key=strategy.key``. Cannot be combined with
+            ``key``.
+
     Returns:
         the best matching error, or ``None`` if the iterable was empty
 
@@ -476,6 +738,15 @@ def best_match(errors, key=relevance):
         set of inputs from version to version if better heuristics are added.
 
     """
+    if strategy is not None:
+        if key is not None:
+            raise TypeError(
+                "Pass either a key or a strategy to best_match, not both.",
+            )
+        key = strategy.key
+    if key is None:
+        key = relevance
+
     best = max(errors, key=key, default=None)
     if best is None:
         return

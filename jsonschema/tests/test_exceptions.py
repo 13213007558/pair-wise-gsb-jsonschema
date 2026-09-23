@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from unittest import TestCase
+import json
 import textwrap
 
 import jsonpath_ng
@@ -757,3 +759,247 @@ class TestJsonPathRendering(TestCase):
 
     def test_open_bracket(self):
         self.validate_json_path_rendering("[", "$['[']")
+
+
+class TestRelevanceStrategy(TestCase):
+    def errors_of(self, instance, schema):
+        return list(_LATEST_VERSION(schema).iter_errors(instance))
+
+    def test_mixed_type_paths_do_not_raise_and_are_deterministic(self):
+        by_name = exceptions.ValidationError("name", path=["属性"])
+        by_index = exceptions.ValidationError("index", path=[0])
+
+        forward = exceptions.relevance(by_name), exceptions.relevance(by_index)
+        self.assertEqual(
+            sorted([by_index, by_name], key=exceptions.relevance),
+            sorted([by_name, by_index], key=exceptions.relevance),
+        )
+        self.assertNotEqual(*forward)
+
+    def test_default_strategy_is_a_total_order(self):
+        strategy = exceptions.RelevanceStrategy()
+        errors = [
+            exceptions.ValidationError(
+                "a", path=["属性", 0], validator="type",
+            ),
+            exceptions.ValidationError(
+                "b", path=["属性", 1], validator="type",
+            ),
+            exceptions.ValidationError("c", path=[0], validator="type"),
+            exceptions.ValidationError("d", path=[], validator="required"),
+        ]
+        keys = [strategy.key(error) for error in errors]
+        self.assertEqual(len(set(keys)), len(keys))
+
+        sorted_once = strategy.sort(errors)
+        sorted_twice = strategy.sort(reversed(errors))
+        self.assertEqual(
+            [error.message for error in sorted_once],
+            [error.message for error in sorted_twice],
+        )
+
+    def test_chinese_property_names_and_nested_arrays(self):
+        schema = {
+            "properties": {
+                "属性": {
+                    "prefixItems": [{"type": "string"}, {"type": "integer"}],
+                },
+            },
+        }
+        instance = {"属性": [1, "不是数字"]}
+        errors = self.errors_of(instance, schema)
+        self.assertEqual(len(errors), 2)
+
+        strategy = exceptions.RelevanceStrategy()
+        ranked = strategy.sort(errors)
+        self.assertEqual(
+            [error.json_path for error in ranked],
+            ["$['属性'][1]", "$['属性'][0]"],
+        )
+        # Sorting does not mutate, merge, or drop errors.
+        self.assertEqual(sorted(map(id, ranked)), sorted(map(id, errors)))
+
+    def test_custom_validator_weights_override_weak_matches(self):
+        schema = {
+            "anyOf": [{"type": "string"}, {"type": "number"}],
+            "required": ["foo"],
+        }
+        errors = self.errors_of(instance={}, schema=schema)
+        self.assertEqual(
+            {error.validator for error in errors}, {"anyOf", "required"},
+        )
+
+        default = exceptions.RelevanceStrategy()
+        self.assertEqual(default.sort(errors)[0].validator, "required")
+
+        boosted = exceptions.RelevanceStrategy(validator_weights={"anyOf": 5})
+        self.assertEqual(boosted.sort(errors)[0].validator, "anyOf")
+
+    def test_reordered_tie_breakers_change_the_ranking(self):
+        errors = [
+            exceptions.ValidationError(
+                "a", path=["a"], schema_path=["zzz", "x"], validator="type",
+            ),
+            exceptions.ValidationError(
+                "b", path=["b"], schema_path=["aaa", "y"], validator="type",
+            ),
+        ]
+
+        by_path_first = exceptions.RelevanceStrategy()
+        by_schema_first = exceptions.RelevanceStrategy(
+            tie_breakers=("schema_path", "path_depth", "path"),
+        )
+        self.assertNotEqual(
+            [error.message for error in by_path_first.sort(errors)],
+            [error.message for error in by_schema_first.sort(errors)],
+        )
+
+    def test_negative_path_weight_prefers_deeper_paths(self):
+        shallow = exceptions.ValidationError("s", path=["a"], validator="t")
+        deep = exceptions.ValidationError(
+            "d", path=["a", "b", "c"], validator="t",
+        )
+        strategy = exceptions.RelevanceStrategy(path_weight=-1.0)
+        self.assertIs(strategy.sort([shallow, deep])[0], deep)
+
+    def test_unknown_tie_breaker_is_rejected(self):
+        with self.assertRaises(ValueError):
+            exceptions.RelevanceStrategy(tie_breakers=("bogus",))
+
+    def test_explain_matches_key_components(self):
+        strategy = exceptions.RelevanceStrategy()
+        error = exceptions.ValidationError(
+            "msg", path=["属性", 0], validator="type",
+        )
+        explained = strategy.explain(error)
+        self.assertEqual(
+            [name for name, _ in explained],
+            list(exceptions.DEFAULT_TIE_BREAKERS),
+        )
+        self.assertEqual(
+            tuple(value for _, value in explained), strategy.key(error),
+        )
+
+    def test_best_match_accepts_a_strategy(self):
+        schema = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+        errors = self.errors_of(instance=[], schema=schema)
+
+        strategy = exceptions.RelevanceStrategy()
+        self.assertEqual(
+            exceptions.best_match(iter(errors), strategy=strategy),
+            strategy.best_match(iter(errors)),
+        )
+        with self.assertRaises(TypeError):
+            exceptions.best_match(
+                iter(errors), key=exceptions.relevance, strategy=strategy,
+            )
+
+    def test_best_match_with_strategy_is_input_order_independent(self):
+        schema = {
+            "dependentSchemas": {
+                "触发": {
+                    "anyOf": [
+                        {"required": ["甲"]},
+                        {"required": ["乙"]},
+                    ],
+                },
+            },
+        }
+        errors = self.errors_of(instance={"触发": True}, schema=schema)
+        strategy = exceptions.RelevanceStrategy()
+
+        best = strategy.best_match(iter(errors))
+        reversed_best = strategy.best_match(iter(reversed(errors)))
+        self.assertEqual(best._contents(), reversed_best._contents())
+        self.assertEqual(best.validator, "required")
+
+        # The context tree of the parent is left fully intact.
+        parent = best.parent
+        self.assertIsNotNone(parent)
+        self.assertEqual(parent.validator, "anyOf")
+        self.assertEqual(len(parent.context), 2)
+
+    def test_recursive_references_are_stable(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"$ref": "#"},
+            },
+        }
+        instance = {"child": {"child": {"name": 3}}}
+        instance["name"] = 1
+        errors = self.errors_of(instance, schema)
+
+        strategy = exceptions.RelevanceStrategy()
+        ranked = strategy.sort(errors)
+        self.assertEqual(
+            [error.json_path for error in ranked],
+            [error.json_path for error in strategy.sort(reversed(errors))],
+        )
+        best = strategy.best_match(iter(errors))
+        self.assertEqual(best.json_path, "$.name")
+
+        deepest_first = exceptions.RelevanceStrategy(path_weight=-1.0)
+        best = deepest_first.best_match(iter(errors))
+        self.assertEqual(best.json_path, "$.child.child.name")
+
+    def test_to_dict_is_json_serializable_and_deterministic(self):
+        schema = {
+            "properties": {
+                "属性": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        }
+        errors = self.errors_of(instance={"属性": 3}, schema=schema)
+        strategy = exceptions.RelevanceStrategy()
+        best = strategy.best_match(iter(errors))
+
+        first = json.dumps(
+            strategy.to_dict(best), ensure_ascii=False, sort_keys=True,
+        )
+        second = json.dumps(
+            strategy.to_dict(best), ensure_ascii=False, sort_keys=True,
+        )
+        self.assertEqual(first, second)
+        self.assertIn("属性", first)
+
+        # The serialized tree mirrors the full original context tree.
+        root = strategy.to_dict(
+            next(error for error in errors if error.context),
+        )
+        self.assertEqual(len(root["context"]), 2)
+        self.assertEqual(root["context"][0]["depth"], 1)
+
+    def test_to_dict_reflects_the_strategy(self):
+        schema = {"properties": {"foo": {"type": "string"}}}
+        (error,) = self.errors_of(instance={"foo": 1}, schema=schema)
+
+        trimmed = exceptions.RelevanceStrategy(tie_breakers=("path_depth",))
+        self.assertEqual(
+            list(trimmed.to_dict(error)["relevance"]), ["path_depth"],
+        )
+
+    def test_parallel_iter_errors_sort_identically(self):
+        schema = {
+            "properties": {
+                "属性": {"prefixItems": [{"type": "string"}]},
+            },
+            "dependentSchemas": {
+                "触发": {"anyOf": [{"required": ["甲"]}, {"type": "null"}]},
+            },
+        }
+        instance = {"属性": [1], "触发": True}
+        strategy = exceptions.RelevanceStrategy()
+
+        def ranked_messages(_):
+            validator = _LATEST_VERSION(schema)
+            errors = validator.iter_errors(instance)
+            return [
+                (error.message, error.json_path)
+                for error in strategy.sort(errors)
+            ]
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(ranked_messages, range(16)))
+        for result in results[1:]:
+            self.assertEqual(result, results[0])

@@ -405,3 +405,74 @@ to guess the most relevant error in a given bunch.
 
 .. autofunction:: by_relevance
     :noindex:
+
+
+Configurable relevance strategies
+---------------------------------
+
+For finer control over how errors are ranked -- for example when a
+client surfaces only the single error closest to the user's input --
+`jsonschema.exceptions.RelevanceStrategy` builds a totally-ordered
+relevance key from a configurable, explainable tie-break table.
+
+.. autoclass:: jsonschema.exceptions.RelevanceStrategy
+    :members: key, explain, sort, best_match, to_dict
+    :noindex:
+
+Each strategy ranks errors using an ordered tuple of tie-breaker
+components. The default table is
+`jsonschema.exceptions.DEFAULT_TIE_BREAKERS`:
+
+======================  ===================================================
+Component               Prefers (by default) ...
+======================  ===================================================
+``path_depth``          shallower instance paths (scaled by
+                        ``path_weight``; use a negative weight to prefer
+                        deeper, more specific paths)
+``path``                instance path elements, with property names
+                        (including non-ASCII ones) ordering before array
+                        indices
+``validator``           higher priority keywords: custom
+                        ``validator_weights`` entries first, otherwise
+                        strong > normal > weak
+``type_match``          errors whose schema ``type`` does not match the
+                        instance
+``depth``               shallower errors within the ``context`` tree
+                        (scaled by ``depth_weight``)
+``schema_path_depth``   shallower schema paths (scaled by
+                        ``schema_path_weight``)
+``schema_path``         schema path elements
+``validator_name``      the keyword name, as a final deterministic
+                        tie-break
+======================  ===================================================
+
+Keys are computed only from structured error attributes -- instance
+path, schema path, validator, and context depth -- never from message
+strings, and sorting never mutates, merges, or deduplicates
+`ValidationError.context`, so results are deterministic even for deep
+:kw:`anyOf` / :kw:`oneOf` / :kw:`dependentSchemas` / :kw:`$ref` trees
+and safe to compute from multiple threads.
+
+.. doctest::
+
+    >>> from jsonschema.exceptions import RelevanceStrategy, best_match
+    >>> schema = {
+    ...     "properties": {
+    ...         "name": {"type": "string"},
+    ...         "phones": {"properties": {"home": {"type": "string"}}},
+    ...     },
+    ... }
+    >>> instance = {"name": 123, "phones": {"home": [123]}}
+    >>> errors = list(Draft202012Validator(schema).iter_errors(instance))
+
+    >>> strategy = RelevanceStrategy(path_weight=-1.0)  # deepest first
+    >>> best = best_match(iter(errors), strategy=strategy)
+    >>> best.json_path
+    '$.phones.home'
+
+    >>> strategy.explain(best)[:2]  # the tie-break table for this error
+    [('path_depth', 2.0), ('path', ((0, 'phones'), (0, 'home')))]
+
+`RelevanceStrategy.to_dict` serializes an error together with its full
+original context tree and its relevance under the strategy, suitable
+for JSON responses.
