@@ -1,3 +1,9 @@
+v4.25.2 (unreleased)
+====================
+
+* Add configurable validation error relevance strategies with explainable,
+  deterministic tie-breaking while preserving complete error context trees.
+
 v4.25.1
 =======
 

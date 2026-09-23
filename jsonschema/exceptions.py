@@ -4,20 +4,21 @@ Validation errors, and some surrounding helpers.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping
+from functools import total_ordering
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import TYPE_CHECKING, Any, ClassVar
-import heapq
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 import re
 import warnings
 
-from attrs import define
+from attrs import define, field
 from referencing.exceptions import Unresolvable as _Unresolvable
 
 from jsonschema import _utils
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+    from collections.abc import Callable, Iterable, MutableMapping, Sequence
 
     from jsonschema import _types
 
@@ -393,7 +394,322 @@ class ErrorTree:
         return len(self.errors) + child_errors
 
 
-def by_relevance(weak=WEAK_MATCHES, strong=STRONG_MATCHES):
+class RelevanceWeights(NamedTuple):
+    """
+    Weights for the criteria used to rank validation errors.
+
+    A criterion with weight zero is omitted from the primary ranking. Some
+    omitted criteria are still used as deterministic tie-breakers, as shown
+    by RelevanceScore.explanation.
+    """
+
+    instance_path: int = 1_000_000
+    schema_path: int = 0
+    validator_priority: int = 100
+    error_depth: int = 10
+    type_match: int = 1
+    custom: int = 1_000
+
+
+class RelevanceCriterion(NamedTuple):
+    """
+    One explainable component of an error relevance score.
+    """
+
+    name: str
+    weight: int
+    value: Any
+    preference: str
+
+
+def _path_key(path: Iterable[str | int]) -> tuple[tuple[int, str], ...]:
+    return tuple(
+        (0, str(segment)) if isinstance(segment, int) else (1, str(segment))
+        for segment in path
+    )
+
+
+def _stable_value(value: Any) -> Any:
+    """
+    Return a deterministic, comparable representation of a JSON-like value.
+    """
+    try:
+        if isinstance(value, Mapping):
+            items = (
+                (_stable_value(key), _stable_value(item))
+                for key, item in value.items()
+            )
+            return ("mapping", tuple(sorted(items)))
+        if isinstance(value, (list, tuple, deque)):
+            return ("sequence", tuple(_stable_value(each) for each in value))
+        if isinstance(value, (set, frozenset)):
+            values = (_stable_value(each) for each in value)
+            return ("set", tuple(sorted(values)))
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return ("value", type(value).__qualname__, repr(value))
+        return ("object", type(value).__qualname__)
+    except (RecursionError, RuntimeError, ValueError):
+        return ("unrepresentable", type(value).__qualname__)
+
+
+@total_ordering
+@define(frozen=True, eq=False)
+class _StablePayloadKey:
+    """
+    A message-independent final tie-breaker for otherwise identical errors.
+    """
+
+    _error: ValidationError
+    _key: Any = field(init=False, default=None)
+
+    @property
+    def key(self) -> Any:
+        key = self._key
+        if key is None:
+            key = (
+                _stable_value(self._error.instance),
+                _stable_value(self._error.schema),
+                _stable_value(self._error.validator_value),
+            )
+            object.__setattr__(self, "_key", key)
+        return key
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _StablePayloadKey):
+            return NotImplemented
+        return self.key == other.key
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, _StablePayloadKey):
+            return NotImplemented
+        return self.key < other.key
+
+    def __repr__(self) -> str:
+        return repr(self.key)
+
+
+@total_ordering
+@define(frozen=True, eq=False)
+class RelevanceScore:
+    """
+    A relevance score and its explainable criteria.
+
+    Scores compare using their complete deterministic tie-break table. The
+    weighted ranking criteria remain separately available via rank, which
+    lets best_match recognize equally relevant branches in an error context
+    without discarding or merging those branches.
+    """
+
+    rank: tuple[Any, ...]
+    tie_breakers: tuple[Any, ...]
+    explanation: tuple[RelevanceCriterion, ...]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RelevanceScore):
+            return NotImplemented
+        return (self.rank, self.tie_breakers) == (
+            other.rank,
+            other.tie_breakers,
+        )
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, RelevanceScore):
+            return NotImplemented
+        return (self.rank, self.tie_breakers) < (
+            other.rank,
+            other.tie_breakers,
+        )
+
+    def same_rank(self, other: RelevanceScore) -> bool:
+        """
+        Return whether two scores have equal weighted ranking criteria.
+        """
+        return isinstance(other, RelevanceScore) and self.rank == other.rank
+
+
+def _error_depth(error: ValidationError) -> int:
+    depth = 0
+    parent = error.parent
+    while parent is not None:
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
+def _zero_weight(error: ValidationError) -> int:
+    return 0
+
+
+@define(frozen=True)
+class RelevanceStrategy:
+    """
+    A configurable strategy for ranking validation errors.
+
+    The strategy is read-only with respect to errors: scoring never mutates
+    ValidationError.context, parents, paths, causes, or any other error
+    attribute.
+    """
+
+    weights: RelevanceWeights = field(factory=RelevanceWeights)
+    validator_priority: Mapping[str, int] = field(factory=dict)
+    custom_weight: Callable[[ValidationError], int] = _zero_weight
+    context_tie: str = "parent"
+
+    def __attrs_post_init__(self) -> None:
+        if any(weight < 0 for weight in self.weights):
+            raise ValueError("relevance weights must be non-negative")
+        if self.context_tie not in {"parent", "best"}:
+            raise ValueError("context_tie must be 'parent' or 'best'")
+        object.__setattr__(
+            self,
+            "validator_priority",
+            dict(self.validator_priority),
+        )
+
+    def __call__(self, error: ValidationError) -> RelevanceScore:
+        return self.score(error)
+
+    def score(self, error: ValidationError) -> RelevanceScore:
+        """
+        Score an error without mutating it or its context tree.
+        """
+        schema_path = tuple(error.absolute_schema_path)
+        depth = _error_depth(error)
+        values = {
+            "schema_path": (-len(schema_path), _path_key(schema_path)),
+            "error_depth": -depth,
+        }
+        if self.weights.instance_path:
+            instance_path = tuple(error.absolute_path)
+            values["instance_path"] = (
+                -len(instance_path),
+                _path_key(instance_path),
+            )
+        if self.weights.validator_priority:
+            values["validator_priority"] = self.validator_priority.get(
+                error.validator,
+                1,
+            )
+        if self.weights.type_match:
+            values["type_match"] = not error._matches_type()
+        if self.weights.custom:
+            values["custom"] = self.custom_weight(error)
+
+        preferences = {
+            "instance_path": "shallower, then lexicographically earlier",
+            "schema_path": "shallower, then lexicographically earlier",
+            "validator_priority": "higher configured priority",
+            "error_depth": "shallower in the error context tree",
+            "type_match": "errors whose declared type matches the instance",
+            "custom": "higher custom weight",
+        }
+
+        criteria = [
+            RelevanceCriterion(
+                name=name,
+                weight=weight,
+                value=values[name],
+                preference=preferences[name],
+            )
+            for name, weight in self.weights._asdict().items()
+            if weight
+        ]
+        criteria.sort(
+            key=lambda criterion: (-criterion.weight, criterion.name),
+        )
+
+        tie_breakers = []
+        if not self.weights.schema_path:
+            tie_breakers.append(
+                RelevanceCriterion(
+                    name="schema_path",
+                    weight=0,
+                    value=values["schema_path"],
+                    preference=preferences["schema_path"],
+                ),
+            )
+        if not self.weights.error_depth:
+            tie_breakers.append(
+                RelevanceCriterion(
+                    name="error_depth",
+                    weight=0,
+                    value=values["error_depth"],
+                    preference=preferences["error_depth"],
+                ),
+            )
+        tie_breakers.extend(
+            [
+                RelevanceCriterion(
+                    name="context_size",
+                    weight=0,
+                    value=len(error.context),
+                    preference="more nested context",
+                ),
+                RelevanceCriterion(
+                    name="cause",
+                    weight=0,
+                    value=(
+                        ""
+                        if error.cause is None
+                        else type(error.cause).__qualname__
+                    ),
+                    preference="lexicographically later cause type",
+                ),
+                RelevanceCriterion(
+                    name="payload",
+                    weight=0,
+                    value=_StablePayloadKey(error),
+                    preference=(
+                        "deterministic instance, schema, and validator value"
+                    ),
+                ),
+            ],
+        )
+
+        return RelevanceScore(
+            rank=tuple(criterion.value for criterion in criteria),
+            tie_breakers=tuple(criterion.value for criterion in tie_breakers),
+            explanation=tuple(
+                criteria
+                + tie_breakers
+                + [
+                    RelevanceCriterion(
+                        name="input_order",
+                        weight=0,
+                        value=None,
+                        preference="earlier input order",
+                    ),
+                ],
+            ),
+        )
+
+
+def _validator_priority_mapping(
+    weak: Iterable[str] | str,
+    strong: Iterable[str] | str,
+    overrides: Mapping[str, int] | None,
+) -> dict[str, int]:
+    if isinstance(weak, str):
+        weak = (weak,)
+    if isinstance(strong, str):
+        strong = (strong,)
+
+    priorities = {validator: 0 for validator in weak}
+    priorities.update((validator, 2) for validator in strong)
+    if overrides is not None:
+        priorities.update(overrides)
+    return priorities
+
+
+def by_relevance(
+    weak=WEAK_MATCHES,
+    strong=STRONG_MATCHES,
+    *,
+    weights=None,
+    validator_priority=None,
+    custom_weight=None,
+    context_tie="parent",
+):
     """
     Create a key function that can be used to sort errors by relevance.
 
@@ -410,19 +726,59 @@ def by_relevance(weak=WEAK_MATCHES, strong=STRONG_MATCHES):
             a collection of validation keywords to consider to be
             "strong"
 
+        weights (RelevanceWeights):
+            weights controlling which relevance criteria participate in the
+            primary ranking, and in which order
+
+        validator_priority (collections.abc.Mapping):
+            explicit priorities for validation keywords, overriding weak and
+            strong
+
+        custom_weight (collections.abc.Callable):
+            a callable receiving each error and returning an integer weight
+
+        context_tie (str):
+            whether best_match returns the parent or descends to the best
+            deterministic child when context errors have equal primary ranks
+
     """
+    if isinstance(weak, RelevanceStrategy):
+        if (
+            strong != STRONG_MATCHES
+            or weights is not None
+            or validator_priority is not None
+            or custom_weight is not None
+            or context_tie != "parent"
+        ):
+            raise TypeError(
+                "cannot combine a relevance strategy with other options",
+            )
+        return weak
 
-    def relevance(error):
-        validator = error.validator
-        return (                        # prefer errors which are ...
-            -len(error.path),           # 'deeper' and thereby more specific
-            error.path,                 # earlier (for sibling errors)
-            validator not in weak,      # for a non-low-priority keyword
-            validator in strong,        # for a high priority keyword
-            not error._matches_type(),  # at least match the instance's type
-        )                               # otherwise we'll treat them the same
+    if isinstance(weak, RelevanceWeights):
+        if weights is not None:
+            raise TypeError("weights were provided twice")
+        weights = weak
+        weak = WEAK_MATCHES
 
-    return relevance
+    if weights is None:
+        weights = RelevanceWeights()
+    elif isinstance(weights, Mapping):
+        weights = RelevanceWeights(**weights)
+
+    if custom_weight is None:
+        custom_weight = _zero_weight
+
+    return RelevanceStrategy(
+        weights=weights,
+        validator_priority=_validator_priority_mapping(
+            weak,
+            strong,
+            validator_priority,
+        ),
+        custom_weight=custom_weight,
+        context_tie=context_tie,
+    )
 
 
 relevance = by_relevance()
@@ -481,10 +837,27 @@ def best_match(errors, key=relevance):
         return
 
     while best.context:
-        # Calculate the minimum via nsmallest, because we don't recurse if
-        # all nested errors have the same relevance (i.e. if min == max == all)
-        smallest = heapq.nsmallest(2, best.context, key=key)
-        if len(smallest) == 2 and key(smallest[0]) == key(smallest[1]):  # noqa: PLR2004
+        scored = [(key(error), error) for error in best.context]
+        smallest_key, smallest = min(
+            scored,
+            key=lambda score_and_error: score_and_error[0],
+        )
+        if isinstance(key, RelevanceStrategy) and key.context_tie == "best":
+            best = smallest
+            continue
+
+        if isinstance(smallest_key, RelevanceScore):
+            tied = any(
+                error is not smallest
+                and other_key.same_rank(smallest_key)
+                for other_key, error in scored
+            )
+        else:
+            tied = any(
+                error is not smallest and other_key == smallest_key
+                for other_key, error in scored
+            )
+        if tied:
             return best
-        best = smallest[0]
+        best = smallest
     return best

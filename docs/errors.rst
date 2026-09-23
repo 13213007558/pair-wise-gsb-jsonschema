@@ -405,3 +405,98 @@ to guess the most relevant error in a given bunch.
 
 .. autofunction:: by_relevance
     :noindex:
+
+
+Configurable relevance strategies
+---------------------------------
+
+The `by_relevance` function returns a `RelevanceStrategy`. The strategy
+scores errors without mutating them, so `ValidationError.context`, `cause`,
+`json_path`, and the rest of the original error tree remain intact. In
+particular, equal errors from different :kw:`anyOf` or :kw:`oneOf`
+branches are never merged or removed.
+
+The primary ranking contains these weighted criteria:
+
+======================  ========  =====================================
+Criterion               Default   Preference
+======================  ========  =====================================
+instance_path           1000000   Shallower, then lexicographically
+                                  earlier absolute instance path
+custom                  1000      Higher value from custom_weight
+validator_priority      100       Higher configured keyword priority
+error_depth             10        Shallower in the error context tree
+type_match              1         The schema's declared type matches the
+                                  instance
+schema_path             0         Shallower, then lexicographically
+                                  earlier absolute schema path
+======================  ========  =====================================
+
+Criteria are ordered by descending weight. Equal weights are ordered by
+criterion name to keep the ranking deterministic. Set a weight to zero to
+remove that criterion from the primary ranking.
+
+If the weighted criteria tie, the following deterministic tie-breakers are
+used in order:
+
+#. schema_path, when its primary weight is zero
+#. error_depth, when its primary weight is zero
+#. context_size
+#. cause type name
+#. a structural key containing the instance, schema, and validator value
+#. input order, for errors which are structurally indistinguishable
+
+Error messages are never used for ranking or tie-breaking. The structural
+payload key is computed lazily, only if all earlier criteria tie.
+
+Every score exposes its ordered criteria through
+`RelevanceScore.explanation`, making the chosen order inspectable:
+
+.. doctest::
+
+    >>> import pprint
+    >>> from jsonschema import Draft202012Validator, exceptions
+    >>> from jsonschema.exceptions import best_match
+    >>> strategy = exceptions.by_relevance(
+    ...     weights=exceptions.RelevanceWeights(schema_path=10),
+    ...     validator_priority={"required": 10},
+    ... )
+    >>> error = next(Draft202012Validator({"required": ["x"]}).iter_errors({}))
+    >>> names = [criterion.name for criterion in strategy(error).explanation]
+    >>> pprint.pprint(names)
+    ['instance_path',
+     'custom',
+     'validator_priority',
+     'error_depth',
+     'schema_path',
+     'type_match',
+     'context_size',
+     'cause',
+     'payload',
+     'input_order']
+
+Pass the strategy as the `best_match` key to use the same ordering while
+descending into error contexts:
+
+.. doctest::
+
+    >>> schema = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    >>> errors = Draft202012Validator(schema).iter_errors([])
+    >>> best_match(errors, key=strategy).validator
+    'type'
+
+By default, equally ranked context errors return their parent error, which
+preserves the historical union-error behavior. Set `context_tie` to
+"best" to descend to the deterministic best child instead.
+
+.. autoclass:: RelevanceWeights
+    :noindex:
+
+.. autoclass:: RelevanceStrategy
+    :noindex:
+
+.. autoclass:: RelevanceScore
+    :noindex:
+
+.. autoclass:: RelevanceCriterion
+    :noindex:

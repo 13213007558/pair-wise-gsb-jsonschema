@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from unittest import TestCase
 import textwrap
 
@@ -382,6 +383,322 @@ class TestByRelevance(TestCase):
 
         match = max([strong, normal, weak], key=best_match)
         self.assertIs(match, strong)
+
+
+class TestRelevanceStrategy(TestCase):
+    def test_explainable_weighted_criteria(self):
+        grandchild = exceptions.ValidationError(
+            "deep",
+            path=["leaf"],
+            schema_path=["type"],
+            validator="type",
+        )
+        child = exceptions.ValidationError(
+            "child",
+            context=[grandchild],
+            schema_path=[0],
+        )
+        parent = exceptions.ValidationError(
+            "parent",
+            context=[child],
+            path=["root"],
+            schema_path=["anyOf"],
+        )
+
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(
+                instance_path=0,
+                schema_path=100,
+                validator_priority=50,
+                error_depth=10,
+                type_match=0,
+                custom=1,
+            ),
+            validator_priority={"type": 37},
+            custom_weight=lambda error: len(error.message),
+        )
+        score = strategy(grandchild)
+
+        self.assertIs(grandchild.parent.parent, parent)
+        self.assertEqual(
+            [
+                (criterion.name, criterion.weight)
+                for criterion in score.explanation
+            ],
+            [
+                ("schema_path", 100),
+                ("validator_priority", 50),
+                ("error_depth", 10),
+                ("custom", 1),
+                ("context_size", 0),
+                ("cause", 0),
+                ("payload", 0),
+                ("input_order", 0),
+            ],
+        )
+        self.assertEqual(
+            score.rank[0],
+            (-3, ((1, "anyOf"), (0, "0"), (1, "type"))),
+        )
+        self.assertEqual(score.rank[1], 37)
+        self.assertEqual(score.rank[2], -2)
+        self.assertEqual(score.rank[3], 4)
+
+    def test_validator_priority_is_stable_regardless_of_messages(self):
+        schema = {"minLength": 5, "pattern": "z"}
+        errors = list(_LATEST_VERSION(schema).iter_errors("a"))
+        strategy = exceptions.by_relevance(
+            validator_priority={"pattern": 10},
+        )
+
+        forward = exceptions.best_match(iter(errors), key=strategy)
+        backward = exceptions.best_match(reversed(errors), key=strategy)
+
+        self.assertEqual(forward.validator, "pattern")
+        self.assertEqual(backward.validator, "pattern")
+        self.assertEqual(forward.json_path, backward.json_path)
+
+    def test_schema_path_weight_distinguishes_union_branches(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"first": {"type": "string"}}},
+                {"properties": {"second": {"type": "integer"}}},
+            ],
+        }
+        instance = {"first": 1, "second": "wrong"}
+        errors = list(_LATEST_VERSION(schema).iter_errors(instance))
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(schema_path=10),
+        )
+
+        best = exceptions.best_match(iter(errors), key=strategy)
+        reversed_best = exceptions.best_match(reversed(errors), key=strategy)
+
+        self.assertEqual(list(best.path), ["first"])
+        self.assertEqual(best._contents(), reversed_best._contents())
+        self.assertEqual(
+            [criterion.name for criterion in strategy(best).explanation],
+            [
+                "instance_path",
+                "custom",
+                "validator_priority",
+                "error_depth",
+                "schema_path",
+                "type_match",
+                "context_size",
+                "cause",
+                "payload",
+                "input_order",
+            ],
+        )
+
+    def test_custom_weight_controls_best_match(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"first": {"type": "string"}}},
+                {"properties": {"second": {"type": "integer"}}},
+            ],
+        }
+        instance = {"first": 1, "second": "wrong"}
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(instance_path=0),
+            custom_weight=lambda error: (
+                -(
+                    bool(error.absolute_path)
+                    and error.absolute_path[-1] == "second"
+                )
+            ),
+        )
+
+        best = exceptions.best_match(
+            _LATEST_VERSION(schema).iter_errors(instance),
+            key=strategy,
+        )
+
+        self.assertEqual(list(best.path), ["second"])
+
+    def test_equal_union_contexts_are_not_deduplicated(self):
+        schema = {"anyOf": [{"type": "string"}, {"type": "string"}]}
+        errors = list(_LATEST_VERSION(schema).iter_errors(12))
+        error, = errors
+
+        self.assertEqual(error.validator, "anyOf")
+        self.assertEqual(len(error.context), 2)
+        self.assertIsNot(error.context[0], error.context[1])
+        self.assertTrue(
+            exceptions.relevance(error.context[0]).same_rank(
+                exceptions.relevance(error.context[1]),
+            ),
+        )
+        self.assertIs(exceptions.best_match(errors), error)
+        self.assertIs(
+            exceptions.best_match(
+                errors,
+                key=lambda each: exceptions.relevance(each),
+            ),
+            error,
+        )
+        self.assertEqual(len(error.context), 2)
+        self.assertTrue(all(child.parent is error for child in error.context))
+
+    def test_context_ties_can_descend_to_the_deterministic_best_error(self):
+        schema = {"anyOf": [{"type": "string"}, {"type": "string"}]}
+        errors = list(_LATEST_VERSION(schema).iter_errors(12))
+        strategy = exceptions.by_relevance(context_tie="best")
+
+        best = exceptions.best_match(errors, key=strategy)
+
+        self.assertEqual(best.validator, "type")
+        self.assertIs(best.parent, errors[0])
+        self.assertEqual(len(errors[0].context), 2)
+
+    def test_disabled_custom_weight_is_not_called(self):
+        def explode(error):  # pragma: no cover
+            raise AssertionError("disabled custom weight was called")
+
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(custom=0),
+            custom_weight=explode,
+        )
+        score = strategy(exceptions.ValidationError("message"))
+
+        self.assertNotIn(
+            "custom",
+            [criterion.name for criterion in score.explanation],
+        )
+
+    def test_best_match_scores_each_context_error_once_per_level(self):
+        scored = []
+
+        def custom_weight(error):
+            scored.append(error)
+            return 0
+
+        children = [
+            exceptions.ValidationError("a", path=["a"], validator="a"),
+            exceptions.ValidationError("b", path=["b"], validator="b"),
+        ]
+        parent = exceptions.ValidationError("parent", context=children)
+        strategy = exceptions.by_relevance(custom_weight=custom_weight)
+
+        exceptions.best_match([parent], key=strategy)
+
+        self.assertEqual(scored, [parent, *children])
+
+    def test_context_tree_and_serialization_are_preserved(self):
+        schema = {
+            "dependentSchemas": {
+                "触发": {
+                    "properties": {
+                        "列表": {
+                            "items": {"items": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+        }
+        instance = {"触发": True, "列表": [[12]]}
+        errors = list(_LATEST_VERSION(schema).iter_errors(instance))
+        error, = errors
+        before = (
+            error.json_path,
+            tuple(error.absolute_path),
+            tuple(error.absolute_schema_path),
+            str(error),
+            error.cause,
+            len(error.context),
+        )
+
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(schema_path=10),
+        )
+        best = exceptions.best_match(errors, key=strategy)
+        sorted(errors, key=strategy)
+
+        after = (
+            error.json_path,
+            tuple(error.absolute_path),
+            tuple(error.absolute_schema_path),
+            str(error),
+            error.cause,
+            len(error.context),
+        )
+        self.assertIs(best, error)
+        self.assertEqual(after, before)
+        self.assertEqual(error.json_path, "$['列表'][0][0]")
+
+    def test_recursive_ref_nested_arrays_and_parallel_errors_are_stable(self):
+        schema = {
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "名称": {"type": "string"},
+                        "孩子": {"$ref": "#/$defs/node"},
+                        "矩阵": {
+                            "items": {"items": {"type": "integer"}},
+                        },
+                    },
+                    "required": ["名称"],
+                },
+            },
+            "$ref": "#/$defs/node",
+        }
+        instance = {
+            "名称": "根",
+            "孩子": {
+                "名称": "子",
+                "孩子": {"名称": 12, "矩阵": [["对"], ["错"]]},
+            },
+        }
+        strategy = exceptions.by_relevance(
+            weights=exceptions.RelevanceWeights(
+                instance_path=0,
+                schema_path=10,
+            ),
+            custom_weight=lambda error: (
+                10 * len(error.absolute_path)
+                + (
+                    error.absolute_path[-2]
+                    if len(error.absolute_path) >= 2
+                    and isinstance(error.absolute_path[-2], int)
+                    else 0
+                )
+            ),
+        )
+
+        def result():
+            validator = _LATEST_VERSION(schema)
+            errors = list(validator.iter_errors(instance))
+            best = exceptions.best_match(iter(errors), key=strategy)
+            reversed_best = exceptions.best_match(
+                reversed(errors),
+                key=strategy,
+            )
+            return (
+                [
+                    (
+                        error.validator,
+                        tuple(error.absolute_path),
+                        tuple(error.absolute_schema_path),
+                        error.json_path,
+                        len(error.context),
+                    )
+                    for error in errors
+                ],
+                best.validator,
+                best.json_path,
+                reversed_best.validator,
+                reversed_best.json_path,
+            )
+
+        expected = result()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: result(), range(8)))
+
+        self.assertEqual(results, [expected] * 8)
+        self.assertEqual(expected[1], "type")
+        self.assertEqual(expected[2], "$['孩子']['孩子']['矩阵'][1][0]")
 
 
 class TestErrorTree(TestCase):
