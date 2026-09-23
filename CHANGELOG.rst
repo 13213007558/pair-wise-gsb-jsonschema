@@ -1,3 +1,11 @@
+Unreleased
+==========
+
+* Properly consider properties evaluated by object-valued ``additionalProperties``
+  and ``unevaluatedProperties`` (including within ``allOf`` / ``anyOf`` /
+  ``if`` / ``then`` / ``else``) when collecting evaluated properties for
+  ``unevaluatedProperties`` under draft 2019-09.
+
 v4.25.1
 =======
 

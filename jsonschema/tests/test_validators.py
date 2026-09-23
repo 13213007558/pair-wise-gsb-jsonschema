@@ -1986,6 +1986,63 @@ class TestDraft201909Validator(ValidatorTestMixin, TestCase):
     valid: tuple[dict, dict] = ({}, {})
     invalid = {"type": "integer"}, "foo"
 
+    def test_unevaluated_properties_with_additional_properties(self):
+        schema = {
+            "properties": {"foo": True},
+            "additionalProperties": {"type": "string"},
+            "unevaluatedProperties": False,
+        }
+        validator = self.Validator(schema)
+        validator.validate({"foo": 1, "bar": "baz"})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"foo": 1, "bar": 37})
+
+    def test_unevaluated_properties_with_additional_properties_in_allOf(self):
+        schema = {
+            "allOf": [
+                {
+                    "properties": {"foo": True},
+                    "additionalProperties": {"type": "string"},
+                },
+            ],
+            "unevaluatedProperties": False,
+        }
+        self.Validator(schema).validate({"foo": 1, "bar": "baz"})
+
+    def test_unevaluated_properties_with_additional_properties_in_anyOf(self):
+        schema = {
+            "anyOf": [
+                {
+                    "properties": {"foo": True},
+                    "additionalProperties": {"type": "string"},
+                },
+            ],
+            "unevaluatedProperties": False,
+        }
+        self.Validator(schema).validate({"foo": 1, "bar": "baz"})
+
+    def test_unevaluated_properties_with_additional_properties_in_if(self):
+        schema = {
+            "if": {"required": ["foo"]},
+            "then": {"additionalProperties": {"type": "string"}},
+            "unevaluatedProperties": False,
+        }
+        self.Validator(schema).validate({"foo": "foo", "bar": "baz"})
+
+        schema = {
+            "if": {"required": ["missing"]},
+            "else": {"additionalProperties": {"type": "string"}},
+            "unevaluatedProperties": False,
+        }
+        self.Validator(schema).validate({"bar": "baz"})
+
+    def test_unevaluated_properties_with_nested_unevaluated_properties(self):
+        schema = {
+            "allOf": [{"unevaluatedProperties": {"type": "string"}}],
+            "unevaluatedProperties": False,
+        }
+        self.Validator(schema).validate({"foo": "bar"})
+
 
 class TestDraft202012Validator(ValidatorTestMixin, TestCase):
     Validator = validators.Draft202012Validator
