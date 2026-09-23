@@ -303,6 +303,313 @@ class TestCreateAndExtend(TestCase):
         self.assertTrue(Derived(schema).is_valid(37))
 
 
+class _KeywordTracker:
+    """
+    A resource tracker for a custom keyword, to observe generator lifetimes.
+    """
+
+    def __init__(self):
+        self.started = 0
+        self.finished = 0
+        self.generated = 0
+
+    @property
+    def active(self):
+        return self.started - self.finished
+
+    def keyword(self, validator, value, instance, schema):
+        self.started += 1
+        try:
+            for index, item in enumerate(instance):
+                if item == "bad":
+                    self.generated += 1
+                    yield exceptions.ValidationError(f"bad item at {index}")
+        finally:
+            self.finished += 1
+
+
+class TestBoundedErrorStream(TestCase):
+    """
+    Tests for the ``limit``/``stop`` arguments and the closable
+    iterator contract of `Validator.iter_errors`.
+    """
+
+    def tracked_validator(self, schema=None, **extra_keywords):
+        trackers = {name: _KeywordTracker() for name in extra_keywords}
+        keywords = {
+            name: tracker.keyword for name, tracker in trackers.items()
+        }
+        cls = validators.extend(validators.Draft202012Validator, keywords)
+        if schema is None:
+            schema = {name: None for name in extra_keywords}
+        return cls(schema), trackers
+
+    def test_no_options_returns_a_plain_generator_with_full_stream(self):
+        import types
+
+        validator = validators.Draft202012Validator({"type": "integer"})
+        errors = validator.iter_errors("nope")
+        self.assertIsInstance(errors, types.GeneratorType)
+        self.assertEqual(len(list(errors)), 1)
+
+    def test_limit_yields_at_most_limit_errors(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        instance = ["bad"] * 10
+
+        stream = validator.iter_errors(instance, limit=3)
+        errors = list(stream)
+
+        self.assertEqual(len(errors), 3)
+        self.assertEqual(stream.count, 3)
+        self.assertTrue(stream.truncated)
+        self.assertIn("limit of 3", stream.truncation_reason)
+        self.assertTrue(stream.closed)
+
+    def test_limit_is_enforced_at_the_generation_boundary(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        instance = ["bad"] * 10
+
+        list(validator.iter_errors(instance, limit=2))
+        tracker = trackers["tracked"]
+        # At most one lookahead error beyond the limit is generated,
+        # rather than generating all 10 errors and slicing afterwards.
+        self.assertLessEqual(tracker.generated, 3)
+        self.assertEqual(tracker.active, 0)
+
+    def test_limit_matching_stream_length_is_not_truncated(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 2, limit=2)
+        errors = list(stream)
+        self.assertEqual(len(errors), 2)
+        self.assertFalse(stream.truncated)
+        self.assertIsNone(stream.truncation_reason)
+        for error in errors:
+            self.assertEqual(error.context, [])
+
+    def test_limit_zero_yields_nothing(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"], limit=0)
+        self.assertEqual(list(stream), [])
+        self.assertTrue(stream.truncated)
+        self.assertIn("limit of 0", stream.truncation_reason)
+
+    def test_limit_zero_on_valid_instance_is_not_truncated(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors([1], limit=0)
+        self.assertEqual(list(stream), [])
+        self.assertFalse(stream.truncated)
+
+    def test_limit_and_stop_arguments_are_validated_eagerly(self):
+        validator = validators.Draft202012Validator({})
+        with self.assertRaises(ValueError):
+            validator.iter_errors(12, limit=-1)
+        with self.assertRaises(TypeError):
+            validator.iter_errors(12, limit="3")
+        with self.assertRaises(TypeError):
+            validator.iter_errors(12, limit=True)
+        with self.assertRaises(TypeError):
+            validator.iter_errors(12, stop=object())
+
+    def test_truncation_is_explained_in_the_last_errors_context(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 5, limit=2)
+        errors = list(stream)
+        note, = errors[-1].context
+        self.assertIsInstance(note, exceptions.ValidationError)
+        self.assertIn("suppressed", note.message)
+        self.assertIn("limit of 2", note.message)
+        self.assertIs(note.parent, errors[-1])
+        self.assertEqual(errors[0].context, [])
+
+    def test_stop_predicate_yields_the_fatal_error_then_stops(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        fatal = lambda error: True  # noqa: E731
+        stream = validator.iter_errors(["bad"] * 5, stop=fatal)
+        errors = list(stream)
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(stream.truncated)
+        self.assertIn("stop predicate", stream.truncation_reason)
+        note, = errors[0].context
+        self.assertIn("stop predicate", note.message)
+
+    def test_stop_predicate_matching_nothing_yields_full_stream(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 3, stop=lambda error: False)
+        self.assertEqual(len(list(stream)), 3)
+        self.assertFalse(stream.truncated)
+
+    def test_stop_predicate_raising_closes_the_stream(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+
+        def boom(error):
+            raise RuntimeError("predicate failed")
+
+        stream = validator.iter_errors(["bad"] * 3, stop=boom)
+        with self.assertRaises(RuntimeError):
+            next(stream)
+        self.assertTrue(stream.closed)
+        self.assertEqual(trackers["tracked"].active, 0)
+
+    def test_close_releases_resources_and_is_idempotent(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 10, limit=100)
+        next(stream)
+        self.assertEqual(trackers["tracked"].active, 1)
+        stream.close()
+        stream.close()
+        self.assertTrue(stream.closed)
+        self.assertEqual(trackers["tracked"].active, 0)
+        with self.assertRaises(StopIteration):
+            next(stream)
+
+    def test_context_manager_closes_on_exit(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        with validator.iter_errors(["bad"] * 10, limit=100) as stream:
+            next(stream)
+        self.assertTrue(stream.closed)
+        self.assertEqual(trackers["tracked"].active, 0)
+
+    def test_context_manager_closes_when_the_body_raises(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 10, limit=100)
+        with self.assertRaises(RuntimeError), stream:
+            next(stream)
+            raise RuntimeError("user code failed")
+        self.assertTrue(stream.closed)
+        self.assertEqual(trackers["tracked"].active, 0)
+
+    def test_breaking_out_then_closing_releases_keyword_generators(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        stream = validator.iter_errors(["bad"] * 10, limit=100)
+        for _ in stream:
+            break
+        stream.close()
+        self.assertEqual(trackers["tracked"].active, 0)
+
+    def test_later_keywords_never_run_once_the_limit_is_hit(self):
+        validator, trackers = self.tracked_validator(first=None, second=None)
+        list(validator.iter_errors(["bad"] * 5, limit=2))
+        self.assertEqual(trackers["second"].started, 0)
+        self.assertEqual(trackers["first"].active, 0)
+
+    def test_error_midstream_releases_resources_and_propagates(self):
+        def flaky(validator, value, instance, schema):
+            yield exceptions.ValidationError("first")
+            raise RuntimeError("boom")
+
+        cls = validators.extend(
+            validators.Draft202012Validator, {"flaky": flaky},
+        )
+        validator = cls({"flaky": None})
+        stream = validator.iter_errors(12, limit=10)
+        next(stream)
+        with self.assertRaises(RuntimeError):
+            next(stream)
+        self.assertTrue(stream.closed)
+
+    def test_early_stop_does_not_leak_state_into_the_next_call(self):
+        validator, _ = self.tracked_validator(tracked=None)
+        instance = ["bad"] * 4
+        baseline = [error.message for error in validator.iter_errors(instance)]
+
+        limited = validator.iter_errors(instance, limit=1)
+        self.assertEqual(len(list(limited)), 1)
+        self.assertTrue(limited.truncated)
+
+        # A subsequent unbounded call sees the complete, unannotated
+        # error stream: no truncation notes, no leftover context.
+        afterwards = list(validator.iter_errors(instance))
+        self.assertEqual(
+            [error.message for error in afterwards], baseline,
+        )
+        for error in afterwards:
+            self.assertEqual(error.context, [])
+            self.assertIsNone(error.parent)
+
+    def test_threaded_reuse_does_not_leak_state_between_calls(self):
+        from threading import Thread
+
+        validator, _ = self.tracked_validator(tracked=None)
+        instance = ["bad"] * 6
+        baseline = [error.message for error in validator.iter_errors(instance)]
+        failures = []
+
+        def use():
+            try:
+                limited = validator.iter_errors(instance, limit=2)
+                if len(list(limited)) != 2 or not limited.truncated:
+                    failures.append("bad limited run")
+                full = [e.message for e in validator.iter_errors(instance)]
+                if full != baseline:
+                    failures.append("state leaked between calls")
+            except Exception as e:  # pragma: no cover  # noqa: BLE001
+                failures.append(e)
+
+        threads = [Thread(target=use) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+
+    def test_resource_stats_are_comparable_across_early_stops(self):
+        validator, trackers = self.tracked_validator(tracked=None)
+        instance = ["bad"] * 5
+        tracker = trackers["tracked"]
+
+        self.assertEqual(tracker.active, 0)
+        list(validator.iter_errors(instance, limit=1))
+        self.assertEqual(tracker.active, 0)
+        list(validator.iter_errors(instance, stop=lambda error: True))
+        self.assertEqual(tracker.active, 0)
+        with validator.iter_errors(instance, limit=100) as stream:
+            next(stream)
+        self.assertEqual(tracker.active, 0)
+        full = list(validator.iter_errors(instance))
+        self.assertEqual(len(full), 5)
+        self.assertEqual(tracker.active, 0)
+
+    def test_evaluated_annotations_survive_a_limit(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"a": {"type": "string"}}},
+                {"properties": {"b": {"type": "integer"}}},
+            ],
+            "unevaluatedProperties": False,
+        }
+        validator = validators.Draft202012Validator(schema)
+        instance = {"a": "ok", "c": "extra"}
+
+        full = [e.message for e in validator.iter_errors(instance)]
+        limited = [e.message for e in validator.iter_errors(instance, limit=1)]
+        # The anyOf branch still marks "a" as evaluated, so only "c" is
+        # reported by unevaluatedProperties, even under a limit.
+        self.assertEqual(full, limited)
+        self.assertEqual(len(limited), 1)
+        self.assertIn("c", limited[0])
+
+    def test_branch_context_is_complete_and_truncation_is_noted(self):
+        schema = {
+            "anyOf": [{"type": "string"}, {"type": "integer"}],
+            "enum": ["a", "b"],
+        }
+        validator = validators.Draft202012Validator(schema)
+
+        full = list(validator.iter_errors(True))
+        anyOf_error = next(e for e in full if e.validator == "anyOf")
+        self.assertEqual(len(anyOf_error.context), 2)
+
+        stream = validator.iter_errors(True, limit=1)
+        limited = list(stream)
+        self.assertTrue(stream.truncated)
+        self.assertEqual(len(limited), 1)
+        # The anyOf error keeps its full branch context, plus a note
+        # explaining the truncation.
+        self.assertEqual(len(limited[0].context), 3)
+        note = limited[0].context[-1]
+        self.assertIn("suppressed", note.message)
+
+
 class TestValidationErrorMessages(TestCase):
     def message_for(self, instance, schema, *args, **kwargs):
         cls = kwargs.pop("cls", validators._LATEST_VERSION)

@@ -1,3 +1,9 @@
+Unreleased
+==========
+
+* Add optional ``limit`` and ``stop`` arguments to ``Validator.iter_errors``.
+  When either is provided, a closable ``jsonschema.validators.BoundedErrorStream`` is returned which enforces the bound at the error generation boundary, notes the truncation reason in the last error's ``context``, and deterministically releases validation resources (resolver scopes, format checkers, dynamic scopes) when closed, exhausted, or failed.
+
 v4.25.1
 =======
 

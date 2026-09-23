@@ -223,6 +223,44 @@ easier debugging.
         3
 
 
+Bounding the Number of Errors
+-----------------------------
+
+Some consumers -- for example an API gateway reporting validation
+failures to clients -- only want to collect a bounded number of the
+most useful errors. `Validator.iter_errors
+<jsonschema.protocols.Validator.iter_errors>` accepts two optional
+keyword arguments for this purpose: ``limit``, a maximum number of
+errors to yield, and ``stop``, a predicate which ends the stream
+after the first error it matches (e.g. a "fatal" keyword)::
+
+    with validator.iter_errors(instance, limit=3) as errors:
+        for error in errors:
+            send_to_client(error)
+
+The limit is enforced at the error generation boundary: once it is
+reached, remaining keywords are never validated, rather than generating
+all errors and slicing them afterwards. When the stream is truncated,
+the last yielded error carries a note in its
+`jsonschema.exceptions.ValidationError.context` explaining why, and
+the returned `jsonschema.validators.BoundedErrorStream` exposes
+``truncated`` and ``truncation_reason`` attributes.
+
+The returned stream is a context manager and also has an idempotent
+``close`` method. Closing it -- whether explicitly, by leaving the
+``with`` block, or because iteration raised -- deterministically
+releases validation resources (resolver scopes, format checkers and
+dynamic scopes), so no annotations or context leak into subsequent
+calls on the same validator, which stays safe to reuse.
+
+Branching keywords like :kw:`anyOf` or :kw:`oneOf` still fully
+evaluate their subschemas internally, so annotations required by e.g.
+:kw:`unevaluatedProperties` are not lost when a limit is used.
+
+If neither option is passed, ``iter_errors`` behaves exactly as
+before, returning a plain generator over the complete error stream.
+
+
 ErrorTrees
 ----------
 

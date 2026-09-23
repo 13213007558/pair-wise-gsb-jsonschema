@@ -41,6 +41,184 @@ _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
 
 
+class BoundedErrorStream:
+    """
+    A closable, bounded iterator over validation errors.
+
+    Instances of this class are returned by
+    `jsonschema.protocols.Validator.iter_errors` when a ``limit`` or
+    ``stop`` argument is provided. The stream pulls lazily from the
+    underlying error generator, so errors beyond the configured boundary
+    are never generated (at most one extra lookahead error is produced
+    internally to detect whether the stream was truncated).
+
+    The stream supports the iterator protocol as well as deterministic
+    cleanup: `close` is idempotent, and the stream is a context manager,
+    so wrapping iteration in a ``with`` block guarantees that the
+    underlying generator -- and any resources it holds, such as resolver
+    scopes, format checking state, or in-progress keyword generators --
+    is released even if iteration is abandoned early, raises, or is
+    cancelled::
+
+        with validator.iter_errors(instance, limit=3) as errors:
+            for error in errors:
+                ...
+
+    All per-call state lives on the stream object itself, never on the
+    validator, so a validator instance may be reused (including across
+    threads) without annotations or context leaking between calls.
+
+    Attributes:
+
+        count (int):
+
+            the number of errors yielded so far
+
+        truncated (bool):
+
+            whether the stream stopped early because of ``limit`` or
+            ``stop`` rather than by exhausting the underlying errors
+
+        truncation_reason (str | None):
+
+            a human-readable explanation of why the stream was
+            truncated, or `None` if it was not
+
+        closed (bool):
+
+            whether the underlying generator has been closed
+    """
+
+    def __init__(self, errors, *, limit=None, stop=None):
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError(
+                    f"limit must be an int or None, got {limit!r}",
+                )
+            if limit < 0:
+                raise ValueError(f"limit must be non-negative, got {limit}")
+        if stop is not None and not callable(stop):
+            raise TypeError(f"stop must be callable or None, got {stop!r}")
+        self._errors = iter(errors)
+        self._limit = limit
+        self._stop = stop
+        self._count = 0
+        self._closed = False
+        self._truncated = False
+        self._truncation_reason = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        if self._limit is not None and self._count >= self._limit:
+            # The limit is already exhausted before pulling another
+            # error (e.g. limit=0): detect truncation and stop.
+            self._truncate(
+                reason=f"the limit of {self._limit} error(s) was reached",
+                error=None,
+                lookahead=True,
+            )
+            raise StopIteration
+        try:
+            error = next(self._errors)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            # The underlying generator failed (or was cancelled); make
+            # sure its resources are released before propagating.
+            self.close()
+            raise
+        self._count += 1
+        if self._stop is not None:
+            try:
+                matched = self._stop(error)
+            except BaseException:
+                self.close()
+                raise
+            if matched:
+                self._truncate(
+                    reason="a stop predicate matched the error",
+                    error=error,
+                )
+        if (
+            not self._closed
+            and self._limit is not None
+            and self._count >= self._limit
+        ):
+            self._truncate(
+                reason=f"the limit of {self._limit} error(s) was reached",
+                error=error,
+                lookahead=True,
+            )
+        return error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    @property
+    def count(self):
+        return self._count
+
+    @property
+    def truncated(self):
+        return self._truncated
+
+    @property
+    def truncation_reason(self):
+        return self._truncation_reason
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def close(self):
+        """
+        Close the underlying error generator, releasing its resources.
+
+        Closing is idempotent and safe to call at any time, including
+        from a different point than where iteration happens.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        errors, self._errors = self._errors, None
+        close = getattr(errors, "close", None)
+        if close is not None:
+            close()
+
+    def _truncate(self, reason, error=None, lookahead=False):
+        suppressed = True
+        if lookahead:
+            # Generate (and discard) at most one further error to learn
+            # whether the limit actually cut the stream short, rather
+            # than coinciding exactly with its natural end.
+            try:
+                next(self._errors)
+            except StopIteration:
+                suppressed = False
+            except BaseException:
+                self.close()
+                raise
+        if suppressed:
+            self._truncated = True
+            self._truncation_reason = reason
+            if error is not None:
+                note = exceptions.ValidationError(
+                    f"Further validation errors were suppressed: {reason}.",
+                )
+                note.parent = error
+                error.context.append(note)
+        self.close()
+
+
 def __getattr__(name):
     if name == "ErrorTree":
         warnings.warn(
@@ -347,7 +525,57 @@ def create(
 
             return NewValidator(**changes)
 
-        def iter_errors(self, instance, _schema=None):
+        def iter_errors(
+            self, instance, _schema=None, *, limit=None, stop=None,
+        ):
+            r"""
+            Lazily yield each of the validation errors in the given instance.
+
+            Arguments:
+
+                instance:
+
+                    the instance to validate
+
+                _schema:
+
+                    .. deprecated:: v4.0.0
+
+                        Passing a schema is deprecated, use
+                        `Validator.evolve` instead.
+
+                limit (int | None):
+
+                    if provided, at most this many errors are yielded.
+                    The limit is enforced at the error generation
+                    boundary: remaining keyword validators are never
+                    run, rather than errors being generated and then
+                    sliced away.
+
+                stop (collections.abc.Callable | None):
+
+                    if provided, a predicate called with each error
+                    before it is yielded. The first error for which the
+                    predicate returns true (e.g. a "fatal" keyword) is
+                    still yielded, after which the stream stops.
+
+            Returns:
+
+                If neither ``limit`` nor ``stop`` is provided, a
+                plain generator yielding the full error stream, exactly
+                as before. Otherwise a `BoundedErrorStream`, which
+                additionally supports `BoundedErrorStream.close` and
+                the context manager protocol to deterministically
+                release validation resources (resolver scopes, format
+                checker state, dynamic scopes) when iteration ends
+                early, raises, or is cancelled.
+
+                When the stream is truncated, the last yielded error
+                carries a note in its
+                `jsonschema.exceptions.ValidationError.context`
+                explaining why, and the stream exposes
+                ``truncated``/``truncation_reason`` attributes.
+            """
             if _schema is not None:
                 warnings.warn(
                     (
@@ -367,6 +595,12 @@ def create(
             else:
                 _schema, validators = self.schema, self._validators
 
+            errors = self._iter_errors(instance, _schema, validators)
+            if limit is None and stop is None:
+                return errors
+            return BoundedErrorStream(errors, limit=limit, stop=stop)
+
+        def _iter_errors(self, instance, _schema, validators):
             if _schema is True:
                 return
             elif _schema is False:
@@ -381,18 +615,27 @@ def create(
 
             for validator, k, v in validators:
                 errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+                try:
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=_schema,
+                            type_checker=self.TYPE_CHECKER,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        yield error
+                finally:
+                    # Ensure keyword generators are deterministically
+                    # closed (releasing any resources they hold) when we
+                    # are closed, rather than relying on garbage
+                    # collection to eventually finalize them.
+                    close = getattr(errors, "close", None)
+                    if close is not None:
+                        close()
 
         def descend(
             self,
@@ -429,22 +672,29 @@ def create(
                     continue
 
                 errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+                try:
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=schema,
+                            type_checker=evolved.TYPE_CHECKER,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        if path is not None:
+                            error.path.appendleft(path)
+                        if schema_path is not None:
+                            error.schema_path.appendleft(schema_path)
+                        yield error
+                finally:
+                    # As in Validator._iter_errors, deterministically
+                    # close keyword generators when we are closed.
+                    close = getattr(errors, "close", None)
+                    if close is not None:
+                        close()
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
