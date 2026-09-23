@@ -1,5 +1,5 @@
 from collections.abc import Mapping, MutableMapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 import itertools
 import re
 
@@ -7,10 +7,28 @@ import re
 class URIDict(MutableMapping):
     """
     Dictionary which uses normalized URIs as keys.
+
+    Normalization consists of lowercasing the scheme and host of the URI
+    (which are case-insensitive per :rfc:`3986`), as well as removing
+    empty fragments (such that ``.../schema`` and ``.../schema#`` are
+    considered equivalent).
     """
 
     def normalize(self, uri):
-        return urlsplit(uri).geturl()
+        split = urlsplit(uri)
+        hostname = split.hostname
+        if hostname is None:
+            return split.geturl()
+        netloc = hostname
+        try:
+            port = split.port
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f"{hostname}:{port}"
+        return urlunsplit(
+            (split.scheme, netloc, split.path, split.query, split.fragment),
+        )
 
     def __init__(self, *args, **kwargs):
         self.store = dict()

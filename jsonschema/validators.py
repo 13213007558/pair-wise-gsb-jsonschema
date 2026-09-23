@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 from urllib.request import urlopen
 from warnings import warn
+from weakref import WeakKeyDictionary
 import contextlib
 import json
 import reprlib
@@ -39,6 +40,38 @@ _UNSET = _utils.Unset()
 
 _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
+
+
+_KNOWN_VOCABULARIES: WeakKeyDictionary[type[Validator], frozenset[str]] = (
+    WeakKeyDictionary()
+)
+
+
+def _swap_http_scheme(uri: str) -> str | None:
+    """
+    Return the given URI with an ``http``/``https`` scheme swapped.
+    """
+    if uri.startswith("http://"):
+        return "https://" + uri[len("http://"):]
+    if uri.startswith("https://"):
+        return "http://" + uri[len("https://"):]
+    return None
+
+
+def _lookup_meta_schema(uri: str) -> type[Validator] | None:
+    """
+    Look up the validator registered for a meta-schema URI.
+
+    The URI is normalized (empty fragments and scheme/host case are
+    insignificant), and ``http`` and ``https`` URIs are considered
+    equivalent if no exact match is found.
+    """
+    if uri in _META_SCHEMAS:
+        return _META_SCHEMAS[uri]
+    swapped = _swap_http_scheme(_META_SCHEMAS.normalize(uri))
+    if swapped is not None and swapped in _META_SCHEMAS:
+        return _META_SCHEMAS[swapped]
+    return None
 
 
 def __getattr__(name):
@@ -132,6 +165,18 @@ def _warn_for_remote_retrieve(uri: str):
 _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
     referencing.Registry(retrieve=_warn_for_remote_retrieve),  # type: ignore[call-arg]
 )
+
+
+def _identification_registry(registry):
+    """
+    Return the registry to use when identifying a schema's dialect.
+
+    Dialect identification must never perform I/O, so the deprecated
+    remote-retrieving registry is treated as no registry at all.
+    """
+    if registry is None or registry is _REMOTE_WARNING_REGISTRY:
+        return None
+    return registry
 
 
 def create(
@@ -266,7 +311,11 @@ def create(
             def evolve(self, **changes):
                 cls = self.__class__
                 schema = changes.setdefault("schema", self.schema)
-                NewValidator = validator_for(schema, default=cls)
+                NewValidator = validator_for(
+                    schema,
+                    default=cls,
+                    registry=_identification_registry(self._registry),
+                )
 
                 for field in fields(cls):  # noqa: F402
                     if not field.init:
@@ -305,14 +354,29 @@ def create(
                     push_scope(id)
 
         @classmethod
-        def check_schema(cls, schema, format_checker=_UNSET):
-            Validator = validator_for(cls.META_SCHEMA, default=cls)
+        def check_schema(cls, schema, format_checker=_UNSET, registry=None):
+            Validator = validator_for(schema, default=cls, registry=registry)
+            if Validator is cls:
+                # The schema didn't identify a different dialect, so it is
+                # checked against this class's own meta-schema, interpreted
+                # under whatever dialect that meta-schema itself declares.
+                Validator = validator_for(cls.META_SCHEMA, default=cls)
+                meta_schema = cls.META_SCHEMA
+            else:
+                meta_schema = Validator.META_SCHEMA
             if format_checker is _UNSET:
                 format_checker = Validator.FORMAT_CHECKER
-            validator = Validator(
-                schema=cls.META_SCHEMA,
-                format_checker=format_checker,
-            )
+            if registry is None:
+                validator = Validator(
+                    schema=meta_schema,
+                    format_checker=format_checker,
+                )
+            else:
+                validator = Validator(
+                    schema=meta_schema,
+                    format_checker=format_checker,
+                    registry=registry,
+                )
             for error in validator.iter_errors(schema):
                 raise exceptions.SchemaError.create_from(error)
 
@@ -339,7 +403,11 @@ def create(
 
         def evolve(self, **changes):
             schema = changes.setdefault("schema", self.schema)
-            NewValidator = validator_for(schema, default=self.__class__)
+            NewValidator = validator_for(
+                schema,
+                default=self.__class__,
+                registry=_identification_registry(self._registry),
+            )
 
             for (attr_name, init_name) in evolve_fields:
                 if init_name not in changes:
@@ -510,6 +578,22 @@ def create(
         safe = version.title().replace(" ", "").replace("-", "")
         Validator.__name__ = Validator.__qualname__ = f"{safe}Validator"
         Validator = validates(version)(Validator)  # type: ignore[misc]
+
+    declared_vocabularies = meta_schema.get("$vocabulary")
+    if isinstance(declared_vocabularies, Mapping) and declared_vocabularies:
+        known_vocabularies = frozenset(
+            _META_SCHEMAS.normalize(each)
+            for each in declared_vocabularies
+            if isinstance(each, str)
+        )
+        base_uri = meta_schema.get("$schema")
+        if isinstance(base_uri, str):
+            base = _META_SCHEMAS.get(base_uri)
+            if base is not None and base is not Validator:
+                known_vocabularies |= _KNOWN_VOCABULARIES.get(
+                    base, frozenset(),
+                )
+        _KNOWN_VOCABULARIES[Validator] = known_vocabularies
 
     return Validator  # type: ignore[return-value]
 
@@ -858,6 +942,19 @@ Draft202012Validator = create(
 )
 
 _LATEST_VERSION: type[Validator] = Draft202012Validator
+
+
+_SPECIFICATIONS_TO_VALIDATORS: dict[
+    referencing.Specification,
+    type[Validator],
+] = {
+    referencing.jsonschema.DRAFT3: Draft3Validator,
+    referencing.jsonschema.DRAFT4: Draft4Validator,
+    referencing.jsonschema.DRAFT6: Draft6Validator,
+    referencing.jsonschema.DRAFT7: Draft7Validator,
+    referencing.jsonschema.DRAFT201909: Draft201909Validator,
+    referencing.jsonschema.DRAFT202012: Draft202012Validator,
+}
 
 
 class _RefResolver:
@@ -1306,6 +1403,9 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
 
     Any other provided positional and keyword arguments will be passed
     on when instantiating the ``cls``.
+    In particular, a ``registry`` argument, if provided, is also used
+    when identifying the schema's dialect and checking the schema
+    itself, not only when resolving references during validation.
 
     Raises:
 
@@ -1322,10 +1422,14 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
         `jsonschema.validators.validates`
 
     """
+    registry = kwargs.get("registry")
     if cls is None:
-        cls = validator_for(schema)
+        cls = validator_for(schema, registry=registry)
 
-    cls.check_schema(schema)
+    if registry is None:
+        cls.check_schema(schema)
+    else:
+        cls.check_schema(schema, registry=registry)
     validator = cls(schema, *args, **kwargs)
     error = exceptions.best_match(validator.iter_errors(instance))
     if error is not None:
@@ -1335,12 +1439,42 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
 def validator_for(
     schema,
     default: type[Validator] | _utils.Unset = _UNSET,
+    registry: referencing.Registry | None = None,
 ) -> type[Validator]:
     """
     Retrieve the validator class appropriate for validating the given schema.
 
     Uses the :kw:`$schema` keyword that should be present in the given
     schema to look up the appropriate validator class.
+
+    The dialect is identified with the following precedence:
+
+    #. Boolean schemas, and schemas without a :kw:`$schema` keyword, use
+       the provided ``default`` (or the latest supported draft if no
+       default is provided).
+
+    #. A :kw:`$schema` URI naming a known meta-schema selects the
+       validator registered for it. URIs are normalized before lookup:
+       empty fragments (``.../schema#``), the case of the scheme and
+       host, and ``http`` versus ``https`` are all insignificant.
+
+    #. Otherwise, if a ``registry`` is provided and the :kw:`$schema`
+       URI resolves to a resource within it, the dialect is identified
+       from that resource -- either via its own :kw:`$schema`
+       declaration (followed recursively, with cycles broken) or via
+       the specification the resource was registered with. Resolution
+       is purely local to the given registry and never performs I/O or
+       mutates the process-wide registries, so interleaved lookups for
+       different dialects cannot contaminate each other.
+
+    #. Otherwise the ``default`` is used, with a deprecation warning if
+       no explicit default was provided.
+
+    Once a dialect is identified, if it supports the :kw:`$vocabulary`
+    keyword, any vocabulary the schema marks as required but which is
+    not known raises `jsonschema.exceptions.UnknownVocabulary`
+    immediately, rather than halfway through validation. Vocabularies
+    marked as not required, and unknown keywords generally, are ignored.
 
     Arguments:
 
@@ -1355,6 +1489,13 @@ def validator_for(
 
             If unprovided, the default is to return the latest supported
             draft.
+
+        registry (referencing.Registry):
+
+            a schema registry to use for resolving :kw:`$schema` URIs
+            which do not name a natively-known meta-schema. This allows
+            custom dialects to be identified offline, without registering
+            them globally.
 
     Examples:
 
@@ -1395,16 +1536,133 @@ def validator_for(
     """
     DefaultValidator = _LATEST_VERSION if default is _UNSET else default
 
-    if schema is True or schema is False or "$schema" not in schema:
+    if schema is True or schema is False or not isinstance(schema, Mapping):
         return DefaultValidator  # type: ignore[return-value]
-    if schema["$schema"] not in _META_SCHEMAS and default is _UNSET:
-        warn(
-            (
-                "The metaschema specified by $schema was not found. "
-                "Using the latest draft to validate, but this will raise "
-                "an error in the future."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    return _META_SCHEMAS.get(schema["$schema"], DefaultValidator)
+    uri = schema.get("$schema")
+    if not isinstance(uri, str):
+        return DefaultValidator  # type: ignore[return-value]
+
+    found = _dialect_for(
+        uri,
+        registry=_identification_registry(registry),
+    )
+    if found is None:
+        if default is _UNSET:
+            warn(
+                (
+                    "The metaschema specified by $schema was not found. "
+                    "Using the latest draft to validate, but this will raise "
+                    "an error in the future."
+                ),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return DefaultValidator  # type: ignore[return-value]
+
+    Validator, known_vocabularies = found
+    if known_vocabularies is not None:
+        _check_declared_vocabularies(schema, known_vocabularies)
+    return Validator
+
+
+def _dialect_for(uri, registry=None, _seen=frozenset()):
+    """
+    Resolve a ``$schema`` URI to a validator class and its vocabularies.
+
+    Returns a ``(validator_class, known_vocabularies)`` tuple, or `None`
+    if the URI does not identify a known dialect. A ``known_vocabularies``
+    of `None` means the dialect predates the ``$vocabulary`` keyword,
+    such that no vocabulary enforcement applies.
+    """
+    Validator = _lookup_meta_schema(uri)
+    if Validator is not None:
+        return Validator, _KNOWN_VOCABULARIES.get(Validator)
+    if registry is None:
+        return None
+    return _dialect_from_registry(
+        registry,
+        _META_SCHEMAS.normalize(uri),
+        _seen,
+    )
+
+
+def _dialect_from_registry(registry, uri, seen):
+    """
+    Resolve a meta-schema URI to a dialect via an offline registry.
+
+    Both explicit ``$schema`` declarations within the retrieved resource
+    (followed recursively, with mutual references broken) and resources
+    registered with an implicit specification are supported.
+    """
+    if uri in seen:
+        return None
+    seen = seen | {uri}
+
+    resource = _retrieve_resource(registry, uri)
+    if resource is None:
+        swapped = _swap_http_scheme(uri)
+        if swapped is not None and swapped not in seen:
+            resource = _retrieve_resource(registry, swapped)
+    if resource is None:
+        return None
+
+    contents = resource.contents
+    if isinstance(contents, Mapping):
+        dialect_uri = contents.get("$schema")
+        if isinstance(dialect_uri, str):
+            found = _dialect_for(dialect_uri, registry=registry, _seen=seen)
+            if found is not None:
+                Validator, vocabularies = found
+                return Validator, _with_declared_vocabularies(
+                    contents,
+                    vocabularies,
+                )
+
+    specification = getattr(resource, "_specification", None)
+    Validator = _SPECIFICATIONS_TO_VALIDATORS.get(specification)
+    if Validator is None:
+        return None
+    vocabularies = _KNOWN_VOCABULARIES.get(Validator)
+    return Validator, _with_declared_vocabularies(contents, vocabularies)
+
+
+def _retrieve_resource(registry, uri):
+    """
+    Retrieve the resource with the given URI from an offline registry.
+    """
+    try:
+        return registry.get_or_retrieve(uri).value
+    except (referencing.exceptions.Unresolvable, KeyError):
+        return None
+
+
+def _with_declared_vocabularies(contents, known_vocabularies):
+    """
+    Add vocabularies declared by a meta-schema to its dialect's known set.
+    """
+    declared = None
+    if isinstance(contents, Mapping):
+        declared = contents.get("$vocabulary")
+    if not isinstance(declared, Mapping) or not declared:
+        return known_vocabularies
+    return (known_vocabularies or frozenset()) | frozenset(
+        _META_SCHEMAS.normalize(each)
+        for each in declared
+        if isinstance(each, str)
+    )
+
+
+def _check_declared_vocabularies(schema, known_vocabularies):
+    """
+    Refuse schemas requiring vocabularies unknown to their dialect.
+    """
+    declared = schema.get("$vocabulary")
+    if not isinstance(declared, Mapping):
+        return
+    for vocabulary, required in declared.items():
+        if not isinstance(vocabulary, str):
+            continue  # malformed, meta-schema validation will report it
+        if required and (
+            _META_SCHEMAS.normalize(vocabulary) not in known_vocabularies
+        ):
+            raise exceptions.UnknownVocabulary(vocabulary, schema)

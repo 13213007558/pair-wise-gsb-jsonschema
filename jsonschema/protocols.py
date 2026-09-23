@@ -119,6 +119,10 @@ class Validator(Protocol):
         """
         Validate the given schema against the validator's `META_SCHEMA`.
 
+        The schema is checked against the meta-schema of the dialect it
+        declares via its ``$schema`` keyword, falling back to this
+        class's `META_SCHEMA` when it does not declare a known one.
+
         Raises:
 
             `jsonschema.exceptions.SchemaError`:

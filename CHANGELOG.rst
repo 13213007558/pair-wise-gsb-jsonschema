@@ -1,3 +1,13 @@
+Unreleased
+==========
+
+* Improve dialect identification in ``jsonschema.validators.validator_for`` (and thereby in ``validate`` and ``Validator.check_schema``):
+
+  * ``$schema`` URIs are now normalized before lookup, so empty fragments, the case of the scheme and host, and ``http`` versus ``https`` no longer cause a schema's dialect to be silently misidentified as the latest draft.
+  * ``validator_for`` accepts a ``registry`` argument, allowing custom dialects to be identified offline from a ``referencing`` registry -- either via explicit ``$schema`` declarations within the registry's resources (followed recursively, with mutual references broken) or via the specification a resource was registered with. Resolution never performs I/O and never mutates the process-wide registries, so interleaved lookups for different dialects stay isolated.
+  * Schemas which declare a required ``$vocabulary`` unknown to their dialect are now refused eagerly with the new ``jsonschema.exceptions.UnknownVocabulary`` (a subclass of ``SchemaError``), rather than being silently validated under a default dialect. Vocabularies marked as not required, and unknown keywords generally, continue to be ignored.
+  * ``Validator.check_schema`` now checks schemas against the meta-schema of the dialect the schema itself declares, falling back to the validator class's own meta-schema only when the schema does not identify one.
+
 v4.25.1
 =======
 

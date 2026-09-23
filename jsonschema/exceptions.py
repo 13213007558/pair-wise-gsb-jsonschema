@@ -215,6 +215,30 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+class UnknownVocabulary(SchemaError):
+    """
+    A schema requires a vocabulary which is not known to this library.
+
+    The JSON Schema specification mandates that implementations refuse
+    to process schemas which declare, via the :kw:`$vocabulary` keyword,
+    a required vocabulary they do not understand. Vocabularies declared
+    as not required, as well as unknown keywords generally, are simply
+    ignored.
+    """
+
+    def __init__(self, vocabulary: str, schema: Any = _unset) -> None:
+        self.vocabulary = vocabulary
+        super().__init__(
+            message=(
+                f"The vocabulary {vocabulary!r} is required by the schema "
+                "but is not known. Refusing to process the schema, as "
+                "vocabularies which are required but unknown must be "
+                "refused."
+            ),
+            schema=schema,
+        )
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

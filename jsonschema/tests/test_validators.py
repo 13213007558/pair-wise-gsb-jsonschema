@@ -16,6 +16,7 @@ import warnings
 from attrs import define, field
 from referencing.jsonschema import DRAFT202012
 import referencing.exceptions
+import referencing.jsonschema
 
 from jsonschema import (
     FormatChecker,
@@ -2150,6 +2151,342 @@ class TestValidatorFor(TestCase):
         schema, default = {"$schema": "mailto:foo@example.com"}, object()
         self.assertIs(validators.validator_for(schema, default), default)
 
+
+class TestValidatorForDialectIdentification(TestCase):
+    def setUp(self):
+        self.addCleanup(
+            self.assertEqual,
+            validators._META_SCHEMAS,
+            dict(validators._META_SCHEMAS),
+        )
+
+    def test_https_and_http_meta_schema_uris_are_equivalent(self):
+        schema = {"$schema": "https://json-schema.org/draft-07/schema#"}
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft7Validator,
+        )
+
+        schema = {"$schema": "http://json-schema.org/draft/2020-12/schema"}
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft202012Validator,
+        )
+
+    def test_scheme_and_host_case_are_insignificant(self):
+        schema = {"$schema": "HTTPS://JSON-SCHEMA.ORG/draft/2020-12/schema"}
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft202012Validator,
+        )
+
+    def test_non_string_schema_keyword_uses_the_default(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertIs(
+                validators.validator_for({"$schema": 12}),
+                validators._LATEST_VERSION,
+            )
+
+    def test_unknown_required_vocabulary_is_refused(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"https://example.com/unknown-vocab": True},
+        }
+        with self.assertRaises(exceptions.UnknownVocabulary) as cm:
+            validators.validator_for(schema)
+        self.assertEqual(
+            cm.exception.vocabulary,
+            "https://example.com/unknown-vocab",
+        )
+
+    def test_unknown_vocabulary_error_is_a_schema_error(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"https://example.com/unknown-vocab": True},
+        }
+        with self.assertRaises(exceptions.SchemaError):
+            validators.validator_for(schema)
+
+    def test_unknown_optional_vocabulary_is_ignored(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"https://example.com/unknown-vocab": False},
+        }
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft202012Validator,
+        )
+
+    def test_known_vocabulary_is_accepted(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+            },
+        }
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft202012Validator,
+        )
+
+    def test_vocabulary_is_an_unknown_keyword_for_older_drafts(self):
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$vocabulary": {"https://example.com/unknown-vocab": True},
+        }
+        self.assertIs(
+            validators.validator_for(schema),
+            validators.Draft7Validator,
+        )
+
+    def test_explicit_default_still_loses_to_known_schema(self):
+        schema = {"$schema": "http://json-schema.org/draft-07/schema#"}
+        self.assertIs(
+            validators.validator_for(
+                schema,
+                default=validators.Draft4Validator,
+            ),
+            validators.Draft7Validator,
+        )
+
+    def offline_registry(self, *resources):
+        return referencing.jsonschema.EMPTY_REGISTRY.with_resources(
+            (
+                resource.contents["$id"],
+                resource,
+            )
+            for resource in resources
+        )
+
+    def test_registry_resolves_explicit_schema_declarations(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        }
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        schema = {"$schema": "urn:example:meta"}
+        self.assertIs(
+            validators.validator_for(schema, registry=registry),
+            validators.Draft202012Validator,
+        )
+
+    def test_registry_resolves_implicit_specifications(self):
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                {"$id": "urn:example:implicit", "type": "object"},
+                default_specification=referencing.jsonschema.DRAFT7,
+            ),
+        )
+        schema = {"$schema": "urn:example:implicit"}
+        self.assertIs(
+            validators.validator_for(schema, registry=registry),
+            validators.Draft7Validator,
+        )
+
+    def test_registry_follows_interlinked_meta_schemas(self):
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                {"$id": "urn:example:one", "$schema": "urn:example:two"},
+                default_specification=referencing.Specification.OPAQUE,
+            ),
+            referencing.jsonschema.Resource.from_contents(
+                {
+                    "$id": "urn:example:two",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                },
+                default_specification=referencing.Specification.OPAQUE,
+            ),
+        )
+        schema = {"$schema": "urn:example:one"}
+        self.assertIs(
+            validators.validator_for(schema, registry=registry),
+            validators.Draft7Validator,
+        )
+
+    def test_registry_mutual_references_fall_back_to_the_default(self):
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                {"$id": "urn:example:one", "$schema": "urn:example:two"},
+                default_specification=referencing.Specification.OPAQUE,
+            ),
+            referencing.jsonschema.Resource.from_contents(
+                {"$id": "urn:example:two", "$schema": "urn:example:one"},
+                default_specification=referencing.Specification.OPAQUE,
+            ),
+        )
+        schema = {"$schema": "urn:example:one"}
+        self.assertIs(
+            validators.validator_for(
+                schema,
+                default=validators.Draft4Validator,
+                registry=registry,
+            ),
+            validators.Draft4Validator,
+        )
+
+    def test_registry_resolution_does_not_leak_into_global_state(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        }
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        schema = {"$schema": "urn:example:meta"}
+        validators.validator_for(schema, registry=registry)
+
+        with self.assertWarns(DeprecationWarning):
+            validators.validator_for(schema)
+        self.assertNotIn("urn:example:meta", validators._META_SCHEMAS.store)
+
+    def test_registry_dialects_declare_their_own_vocabularies(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"urn:example:vocab": True},
+        }
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        schema = {
+            "$schema": "urn:example:meta",
+            "$vocabulary": {"urn:example:vocab": True},
+        }
+        self.assertIs(
+            validators.validator_for(schema, registry=registry),
+            validators.Draft202012Validator,
+        )
+
+        schema["$vocabulary"] = {"urn:example:other-vocab": True}
+        with self.assertRaises(exceptions.UnknownVocabulary):
+            validators.validator_for(schema, registry=registry)
+
+    def test_interleaved_dialects_keep_isolated_state(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        }
+        registry = self.offline_registry(
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        schemas = [
+            (
+                {"$schema": "http://json-schema.org/draft-07/schema#"},
+                validators.Draft7Validator,
+            ),
+            (
+                {"$schema": "urn:example:meta"},
+                validators.Draft202012Validator,
+            ),
+            (
+                {"$schema": "https://json-schema.org/draft/2019-09/schema"},
+                validators.Draft201909Validator,
+            ),
+            (
+                {"$schema": "urn:example:meta"},
+                validators.Draft202012Validator,
+            ),
+            (
+                {"$schema": "http://json-schema.org/draft-07/schema#"},
+                validators.Draft7Validator,
+            ),
+        ]
+        for schema, expected in schemas:
+            with self.subTest(schema=schema):
+                self.assertIs(
+                    validators.validator_for(schema, registry=registry),
+                    expected,
+                )
+                self.assertIs(
+                    validators.validator_for(schema, registry=registry),
+                    expected,
+                )
+
+
+class TestValidateDialectIdentification(TestCase):
+    def test_validate_refuses_unknown_required_vocabulary_eagerly(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"https://example.com/unknown-vocab": True},
+        }
+        with self.assertRaises(exceptions.UnknownVocabulary):
+            validators.validate(object(), schema)
+
+    def test_validate_uses_the_registry_for_identification(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        }
+        registry = referencing.jsonschema.EMPTY_REGISTRY.with_resource(
+            "urn:example:meta",
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        schema = {"$schema": "urn:example:meta", "type": "integer"}
+        validators.validate(12, schema, registry=registry)
+        with self.assertRaises(exceptions.ValidationError):
+            validators.validate("foo", schema, registry=registry)
+
+    def test_explicit_cls_still_wins_over_schema_declaration(self):
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "integer",
+        }
+        validators.validate(
+            12,
+            schema,
+            cls=validators.Draft202012Validator,
+        )
+
+    def test_check_schema_uses_the_schemas_declared_dialect(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "prefixItems": "not-an-array",
+        }
+        with self.assertRaises(exceptions.SchemaError):
+            validators.Draft7Validator.check_schema(schema)
+
+    def test_check_schema_refuses_unknown_required_vocabulary(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {"https://example.com/unknown-vocab": True},
+        }
+        with self.assertRaises(exceptions.UnknownVocabulary):
+            validators.Draft202012Validator.check_schema(schema)
+
+    def test_check_schema_with_registry(self):
+        meta_schema = {
+            "$id": "urn:example:meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+        }
+        registry = referencing.jsonschema.EMPTY_REGISTRY.with_resource(
+            "urn:example:meta",
+            referencing.jsonschema.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+        validators.Draft202012Validator.check_schema(
+            {"$schema": "urn:example:meta", "type": "integer"},
+            registry=registry,
+        )
 
 class TestValidate(TestCase):
     def assertUses(self, schema, Validator):
