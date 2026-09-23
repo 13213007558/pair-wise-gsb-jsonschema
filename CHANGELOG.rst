@@ -1,3 +1,25 @@
+v4.26.0
+=======
+
+* ``jsonschema.validators.validator_for`` now raises ``SchemaError`` when a
+  schema's ``$schema`` keyword names an unknown meta-schema (and no explicit
+  default was provided), or when it is not a string, rather than emitting a
+  deprecation warning and silently validating with the latest draft.
+  Schemas whose dialect cannot be identified are now rejected up front,
+  before any instance validation occurs.
+* Validator classes now know which ``$vocabulary`` vocabularies they support
+  (via the new ``vocabularies`` argument to ``jsonschema.validators.create``,
+  exposed as ``Validator.VOCABULARIES``). ``Validator.check_schema`` (and
+  therefore ``jsonschema.validate``) now refuses schemas which declare an
+  unsupported vocabulary as *required*, raising ``SchemaError`` as the
+  specification mandates, instead of silently ignoring the vocabulary's
+  keywords. Optional (``"required": false``) vocabularies and unknown
+  keywords remain ignored.
+* When schemas mix dialects (a subschema declares its own ``$schema``),
+  subresource identifiers are now interpreted using the subschema's own
+  dialect, so e.g. draft-04-style ``id`` identifiers inside a 2020-12
+  document resolve references correctly.
+
 v4.25.1
 =======
 

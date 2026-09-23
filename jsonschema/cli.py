@@ -244,10 +244,10 @@ def run(arguments, stdout=sys.stdout, stderr=sys.stderr, stdin=sys.stdin):  # no
         return 1
 
     Validator = arguments["validator"]
-    if Validator is None:
-        Validator = validator_for(schema)
 
     try:
+        if Validator is None:
+            Validator = validator_for(schema)
         Validator.check_schema(schema)
     except SchemaError as error:
         outputter.validation_error(

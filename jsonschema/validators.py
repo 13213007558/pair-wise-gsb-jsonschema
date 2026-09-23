@@ -10,7 +10,6 @@ from operator import methodcaller
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 from urllib.request import urlopen
-from warnings import warn
 import contextlib
 import json
 import reprlib
@@ -147,6 +146,7 @@ def create(
     applicable_validators: _typing.ApplicableValidators = methodcaller(
         "items",
     ),
+    vocabularies: Iterable[str] = (),
 ) -> type[Validator]:
     """
     Create a new validator class.
@@ -207,6 +207,20 @@ def create(
             implement similar behavior, you can typically ignore this argument
             and leave it at its default.
 
+        vocabularies:
+
+            an iterable of URIs identifying the vocabularies (as
+            declared by the :kw:`$vocabulary` keyword) that the new
+            validator class supports.
+
+            When a schema declares, via :kw:`$vocabulary`, that a
+            vocabulary is *required* but its URI is not in this
+            collection, `Validator.check_schema` will refuse to
+            process the schema by raising `jsonschema.exceptions.SchemaError`,
+            as mandated by the specification. Vocabularies declared
+            with ``"required": false`` (or any other falsy value) are
+            ignored, along with any unknown keywords they introduce.
+
     Returns:
 
         a new `jsonschema.protocols.Validator` class
@@ -228,8 +242,10 @@ def create(
         TYPE_CHECKER = type_checker
         FORMAT_CHECKER = format_checker_arg
         ID_OF = staticmethod(id_of)
+        VOCABULARIES = frozenset(vocabularies)
 
         _APPLICABLE_VALIDATORS = applicable_validators
+        _SPECIFICATION = specification
         _validators = field(init=False, repr=False, eq=False)
 
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
@@ -285,7 +301,7 @@ def create(
                 registry = self._registry
                 if registry is not _REMOTE_WARNING_REGISTRY:
                     registry = SPECIFICATIONS.combine(registry)
-                resource = specification.create_resource(self.schema)
+                resource = self._SPECIFICATION.create_resource(self.schema)
                 self._resolver = registry.resolver_with_root(resource)
 
             if self.schema is True or self.schema is False:
@@ -315,6 +331,7 @@ def create(
             )
             for error in validator.iter_errors(schema):
                 raise exceptions.SchemaError.create_from(error)
+            _check_declared_vocabulary(cls, schema)
 
         @property
         def resolver(self):
@@ -418,8 +435,14 @@ def create(
                 evolved = self.evolve(schema=schema)
             else:
                 if resolver is None:
+                    NewValidator = validator_for(
+                        schema, default=self.__class__,
+                    )
+                    dialect = getattr(
+                        NewValidator, "_SPECIFICATION", self._SPECIFICATION
+                    )
                     resolver = self._resolver.in_subresource(
-                        specification.create_resource(schema),
+                        dialect.create_resource(schema),
                     )
                 evolved = self.evolve(schema=schema, _resolver=resolver)
 
@@ -514,6 +537,38 @@ def create(
     return Validator  # type: ignore[return-value]
 
 
+def _check_declared_vocabulary(cls, schema):
+    """
+    Ensure every vocabulary the schema requires is one ``cls`` supports.
+
+    Schemas declare the vocabularies they rely on via the
+    :kw:`$vocabulary` keyword. Any vocabulary marked as required which
+    the validator class does not know makes the schema unprocessable,
+    so a `jsonschema.exceptions.SchemaError` is raised (rather than
+    silently ignoring the vocabulary's keywords, or worse, reporting
+    instances as invalid for the wrong reason). Vocabularies declared
+    as optional are ignored, as are any unknown keywords they define.
+    """
+    if schema is True or schema is False:
+        return
+    declared = schema.get("$vocabulary")
+    if not isinstance(declared, Mapping):
+        return
+    known = {urlsplit(each).geturl() for each in cls.VOCABULARIES}
+    if not known:
+        return
+    for uri, required in declared.items():
+        if not required:
+            continue
+        if not isinstance(uri, str) or urlsplit(uri).geturl() not in known:
+            raise exceptions.SchemaError(
+                f"The schema declares that it requires the {uri!r} "
+                f"vocabulary, which {cls.__name__} does not support. "
+                f"Refusing to process the schema, as its meaning cannot "
+                f"be determined without it.",
+            )
+
+
 def extend(
     validator,
     validators=(),
@@ -596,6 +651,7 @@ def extend(
         format_checker=format_checker,
         id_of=validator.ID_OF,
         applicable_validators=validator._APPLICABLE_VALIDATORS,
+        vocabularies=getattr(validator, "VOCABULARIES", ()),
     )
 
 
@@ -808,6 +864,14 @@ Draft201909Validator = create(
     type_checker=_types.draft201909_type_checker,
     format_checker=_format.draft201909_format_checker,
     version="draft2019-09",
+    vocabularies=[
+        "https://json-schema.org/draft/2019-09/vocab/applicator",
+        "https://json-schema.org/draft/2019-09/vocab/content",
+        "https://json-schema.org/draft/2019-09/vocab/core",
+        "https://json-schema.org/draft/2019-09/vocab/format",
+        "https://json-schema.org/draft/2019-09/vocab/meta-data",
+        "https://json-schema.org/draft/2019-09/vocab/validation",
+    ],
 )
 
 Draft202012Validator = create(
@@ -855,6 +919,15 @@ Draft202012Validator = create(
     type_checker=_types.draft202012_type_checker,
     format_checker=_format.draft202012_format_checker,
     version="draft2020-12",
+    vocabularies=[
+        "https://json-schema.org/draft/2020-12/vocab/applicator",
+        "https://json-schema.org/draft/2020-12/vocab/content",
+        "https://json-schema.org/draft/2020-12/vocab/core",
+        "https://json-schema.org/draft/2020-12/vocab/format-annotation",
+        "https://json-schema.org/draft/2020-12/vocab/meta-data",
+        "https://json-schema.org/draft/2020-12/vocab/unevaluated",
+        "https://json-schema.org/draft/2020-12/vocab/validation",
+    ],
 )
 
 _LATEST_VERSION: type[Validator] = Draft202012Validator
@@ -1304,6 +1377,14 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
     :kw:`$schema` property is found, the default validator class is the
     latest released draft.
 
+    If the :kw:`$schema` property is present but does not identify a
+    known meta-schema, a `jsonschema.exceptions.SchemaError` is raised
+    immediately, before any instance validation occurs, rather than
+    silently validating with a possibly-wrong dialect. Similarly, if
+    the schema declares (via :kw:`$vocabulary`) that it requires a
+    vocabulary the validator does not support, a
+    `jsonschema.exceptions.SchemaError` is raised.
+
     Any other provided positional and keyword arguments will be passed
     on when instantiating the ``cls``.
 
@@ -1392,19 +1473,53 @@ def validator_for(
         Always including the keyword when authoring schemas is highly
         recommended.
 
+    The lookup proceeds in the following order:
+
+        1. Boolean schemas, and schemas with no :kw:`$schema` keyword at
+           all, use the provided ``default`` (or the latest supported
+           draft if none was provided).
+
+        2. Otherwise, the :kw:`$schema` URI is normalized (in particular
+           any empty fragment is discarded) and looked up amongst the
+           meta-schemas known to `jsonschema.validators.validates`. If it
+           matches, the corresponding validator class is returned.
+
+        3. If the URI is not recognized, an explicitly provided
+           ``default`` is returned.
+
+    Raises:
+
+        `jsonschema.exceptions.SchemaError`:
+
+            if the :kw:`$schema` keyword is present but is not a string,
+            or names a meta-schema which is not known and no ``default``
+            was provided. In both cases no validator can be selected
+            reliably, so rather than silently validating with the wrong
+            dialect, the schema is rejected up front -- before any
+            instance validation occurs.
+
     """
     DefaultValidator = _LATEST_VERSION if default is _UNSET else default
 
     if schema is True or schema is False or "$schema" not in schema:
         return DefaultValidator  # type: ignore[return-value]
-    if schema["$schema"] not in _META_SCHEMAS and default is _UNSET:
-        warn(
-            (
-                "The metaschema specified by $schema was not found. "
-                "Using the latest draft to validate, but this will raise "
-                "an error in the future."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
+
+    uri = schema["$schema"]
+    if not isinstance(uri, str):
+        raise exceptions.SchemaError(
+            f"The $schema keyword's value must be a string containing "
+            f"the URI of a known meta-schema, not {uri!r}.",
         )
-    return _META_SCHEMAS.get(schema["$schema"], DefaultValidator)
+
+    Validator = _META_SCHEMAS.get(uri)
+    if Validator is not None:
+        return Validator
+    if default is not _UNSET:
+        return default  # type: ignore[return-value]
+    raise exceptions.SchemaError(
+        f"The metaschema specified by $schema ({uri!r}) was not found. "
+        f"Refusing to silently select a different dialect to validate "
+        f"with. Either declare a supported dialect, register one via "
+        f"jsonschema.validators.validates, or pass an explicit default "
+        f"validator class.",
+    )

@@ -2128,17 +2128,16 @@ class TestValidatorFor(TestCase):
     def test_validator_for_custom_default(self):
         self.assertIs(validators.validator_for({}, default=None), None)
 
-    def test_warns_if_meta_schema_specified_was_not_found(self):
-        with self.assertWarns(DeprecationWarning) as cm:
+    def test_unknown_meta_schema_is_an_error(self):
+        with self.assertRaises(exceptions.SchemaError) as cm:
             validators.validator_for(schema={"$schema": "unknownSchema"})
+        self.assertIn("unknownSchema", str(cm.exception))
 
-        self.assertEqual(cm.filename, __file__)
-        self.assertEqual(
-            str(cm.warning),
-            "The metaschema specified by $schema was not found. "
-            "Using the latest draft to validate, but this will raise "
-            "an error in the future.",
-        )
+    def test_non_string_schema_keyword_is_an_error(self):
+        for invalid in [37, ["https://json-schema.org/draft-07/schema#"]]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(exceptions.SchemaError):
+                    validators.validator_for(schema={"$schema": invalid})
 
     def test_does_not_warn_if_meta_schema_is_unspecified(self):
         with warnings.catch_warnings(record=True) as w:
@@ -2228,6 +2227,20 @@ class TestValidate(TestCase):
             "(?s)Failed validating '.*' in schema.*On instance",
         )
 
+    def test_explicit_cls_takes_priority_over_schema_keyword(self):
+        validators.validate(
+            "foo",
+            {"$schema": "https://example.com/unknown", "type": "string"},
+            cls=validators.Draft7Validator,
+        )
+
+    def test_unknown_dialect_is_a_schema_error_not_validation_error(self):
+        with self.assertRaises(exceptions.SchemaError):
+            validators.validate(
+                "foo",
+                {"$schema": "https://example.com/unknown"},
+            )
+
     def test_schema_error_message(self):
         with self.assertRaises(exceptions.SchemaError) as e:
             validators.validate(12, {"type": 12})
@@ -2246,6 +2259,208 @@ class TestValidate(TestCase):
         with self.assertRaises(exceptions.ValidationError) as e:
             validators.validate(12, schema)
         self.assertIn("12 is less than the minimum of 20", str(e.exception))
+
+
+class TestCheckSchemaVocabulary(TestCase):
+    UNKNOWN = "https://example.com/unknown-vocabulary"
+
+    def schema202012(self, vocabulary, **kwargs):
+        return {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": vocabulary,
+            **kwargs,
+        }
+
+    def test_unknown_required_vocabulary_is_a_schema_error(self):
+        schema = self.schema202012({self.UNKNOWN: True})
+        with self.assertRaises(exceptions.SchemaError) as cm:
+            validators.Draft202012Validator.check_schema(schema)
+        self.assertIn(self.UNKNOWN, str(cm.exception))
+
+    def test_validate_raises_schema_error_not_validation_error(self):
+        schema = self.schema202012({self.UNKNOWN: True})
+        with self.assertRaises(exceptions.SchemaError):
+            validators.validate("an instance", schema)
+
+    def test_unknown_optional_vocabulary_is_ignored(self):
+        schema = self.schema202012({self.UNKNOWN: False}, type="integer")
+        validators.Draft202012Validator.check_schema(schema)
+        validators.validate(12, schema)
+        with self.assertRaises(exceptions.ValidationError):
+            validators.validate("not an integer", schema)
+
+    def test_unknown_keywords_are_ignored_without_vocabulary(self):
+        validators.validate(
+            instance=12,
+            schema={
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "someUnknownKeyword": 37,
+                "type": "integer",
+            },
+        )
+
+    def test_all_official_202012_vocabularies_are_supported(self):
+        schema = self.schema202012(
+            {
+                "https://json-schema.org/draft/2020-12/vocab/" + name: True
+                for name in [
+                    "applicator",
+                    "content",
+                    "core",
+                    "format-annotation",
+                    "meta-data",
+                    "unevaluated",
+                    "validation",
+                ]
+            },
+        )
+        validators.Draft202012Validator.check_schema(schema)
+
+    def test_vocabulary_uris_are_normalized(self):
+        schema = self.schema202012(
+            {"https://json-schema.org/draft/2020-12/vocab/core#": True},
+        )
+        validators.Draft202012Validator.check_schema(schema)
+
+    def test_201909_vocabularies(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2019-09/schema",
+            "$vocabulary": {
+                "https://json-schema.org/draft/2019-09/vocab/core": True,
+                "https://json-schema.org/draft/2019-09/vocab/format": True,
+            },
+        }
+        validators.Draft201909Validator.check_schema(schema)
+
+        schema["$vocabulary"][self.UNKNOWN] = True
+        with self.assertRaises(exceptions.SchemaError):
+            validators.Draft201909Validator.check_schema(schema)
+
+    def test_vocabulary_is_ignored_by_drafts_without_support(self):
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$vocabulary": {self.UNKNOWN: True},
+        }
+        validators.Draft7Validator.check_schema(schema)
+
+    def test_extended_validators_keep_vocabularies(self):
+        Extended = validators.extend(validators.Draft202012Validator)
+        self.assertEqual(
+            Extended.VOCABULARIES,
+            validators.Draft202012Validator.VOCABULARIES,
+        )
+        with self.assertRaises(exceptions.SchemaError):
+            Extended.check_schema(self.schema202012({self.UNKNOWN: True}))
+
+    def test_vocabularies_are_not_shared_between_dialects(self):
+        self.assertIsInstance(
+            validators.Draft202012Validator.VOCABULARIES,
+            frozenset,
+        )
+        self.assertNotEqual(
+            validators.Draft201909Validator.VOCABULARIES,
+            validators.Draft202012Validator.VOCABULARIES,
+        )
+
+
+class TestCrossDialect(TestCase):
+    def test_newer_dialect_subschema(self):
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "properties": {
+                "nested": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "prefixItems": [{"const": 1}],
+                    "items": False,
+                },
+            },
+        }
+        validators.validate({"nested": [1]}, schema)
+        with self.assertRaises(exceptions.ValidationError):
+            validators.validate({"nested": [1, 2]}, schema)
+
+    def test_older_dialect_subschema(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "nested": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "items": [{"const": 1}],
+                    "additionalItems": False,
+                },
+            },
+        }
+        # NOTE: check_schema is intentionally not called here -- the
+        # nested draft-07-only `items` array form is invalid under the
+        # root dialect's (2020-12) meta-schema, even though each
+        # subschema is valid under its own declared dialect.
+        validator = validators.Draft202012Validator(schema)
+        validator.validate({"nested": [1]})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"nested": [1, 2]})
+
+    def test_subschema_identifiers_use_their_own_dialect(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "nested": {
+                    "$schema": "http://json-schema.org/draft-04/schema#",
+                    "id": "https://example.com/nested",
+                    "definitions": {
+                        "num": {
+                            "id": "https://example.com/num",
+                            "type": "integer",
+                        },
+                    },
+                    "properties": {
+                        "count": {"$ref": "num"},
+                    },
+                },
+            },
+        }
+        validators.validate({"nested": {"count": 37}}, schema)
+        with self.assertRaises(exceptions.ValidationError):
+            validators.validate({"nested": {"count": "no"}}, schema)
+
+    def test_offline_registry_with_mixed_dialects(self):
+        draft7 = {
+            "$id": "https://example.com/draft7",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "items": [{"const": 1}],
+            "additionalItems": False,
+        }
+        registry = referencing.Registry().with_resource(
+            "https://example.com/draft7",
+            referencing.Resource.from_contents(draft7),
+        )
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "https://example.com/draft7",
+        }
+        validator = validators.Draft202012Validator(schema, registry=registry)
+        validator.validate([1])
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate([1, 2])
+
+    def test_mutually_referencing_offline_resources(self):
+        a = {
+            "$id": "https://example.com/a",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"child": {"$ref": "https://example.com/b"}},
+        }
+        b = {
+            "$id": "https://example.com/b",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "properties": {"child": {"$ref": "https://example.com/a"}},
+            "required": ["child"],
+        }
+        registry = referencing.Registry().with_contents(
+            [("https://example.com/a", a), ("https://example.com/b", b)],
+        )
+        validator = validators.Draft202012Validator(a, registry=registry)
+        validator.validate({"child": {"child": {}}})
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate({"child": {}})
 
 
 class TestThreading(TestCase):
