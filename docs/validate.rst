@@ -41,6 +41,47 @@ The Validator Protocol
 All of the `versioned validators <versioned-validators>` that are included with `jsonschema` adhere to the protocol, and any `extensions of these validators <jsonschema.validators.extend>` will as well.
 For more information on `creating <jsonschema.validators.create>` or `extending <jsonschema.validators.extend>` validators see `creating-validators`.
 
+.. _stopping-early:
+
+Stopping Early
+--------------
+
+Callers which only need a bounded number of errors -- for example an API
+gateway reporting the first few problems with a request body -- can pass
+``limit`` and/or ``stop`` to `jsonschema.protocols.Validator.iter_errors`:
+
+.. code:: python
+
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    validator = jsonschema.Draft202012Validator(schema)
+
+    with validator.iter_errors({"a": "nope"}, limit=5) as errors:
+        for error in errors:
+            print(error.message)
+
+The limit is enforced while errors are generated, not by collecting all
+errors and slicing them afterwards, and ``stop`` ends iteration after the
+first error it accepts (e.g. the first error for a keyword you consider
+fatal).
+
+The returned `jsonschema.validators.ErrorStream` guarantees that whenever
+iteration ends -- whether it is exhausted, hits the limit or stop
+predicate, is explicitly closed, is abandoned after ``break``, or raises
+-- any state held by the validation run (pending keyword generators,
+resolver scopes, dynamic scopes and format checker references) is released
+before the validator is used again, so subsequent calls never observe
+leftover annotations or context from a previous run.
+When iteration stops early, the last yielded error's
+`jsonschema.exceptions.ValidationError.context` explains why the stream
+was truncated, and the stream's ``truncated``, ``truncation_reason`` and
+``yielded`` attributes (along with the ``ErrorStream.active`` counter)
+allow comparing resource usage between runs.
+Passing neither option yields the complete stream of errors, as before.
+
+.. autoclass:: jsonschema.validators.ErrorStream
+    :noindex:
+    :members:
+
 Type Checking
 -------------
 

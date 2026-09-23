@@ -20,6 +20,7 @@ from jsonschema.validators import (
     Draft7Validator,
     Draft201909Validator,
     Draft202012Validator,
+    ErrorStream,
     validate,
 )
 
@@ -112,6 +113,7 @@ __all__ = [
     "Draft7Validator",
     "Draft201909Validator",
     "Draft202012Validator",
+    "ErrorStream",
     "FormatChecker",
     "SchemaError",
     "TypeChecker",

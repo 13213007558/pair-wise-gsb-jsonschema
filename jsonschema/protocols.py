@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 # therefore, only import at type-checking time (to avoid circular references),
 # but use `jsonschema` for any types which will otherwise not be resolvable
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
     import referencing.jsonschema
 
@@ -167,7 +167,13 @@ class Validator(Protocol):
 
         """
 
-    def iter_errors(self, instance: Any) -> Iterable[ValidationError]:
+    def iter_errors(
+        self,
+        instance: Any,
+        *,
+        limit: int | None = None,
+        stop: Callable[[ValidationError], bool] | None = None,
+    ) -> Iterable[ValidationError]:
         r"""
         Lazily yield each of the validation errors in the given instance.
 
@@ -181,6 +187,16 @@ class Validator(Protocol):
         ...     print(error.message)
         4 is not one of [1, 2, 3]
         [2, 3, 4] is too long
+
+        If ``limit`` is provided, at most that many errors are yielded,
+        with the limit enforced as errors are generated rather than by
+        slicing the complete set of errors. If ``stop`` is provided, it
+        is called with each error, and iteration ends after the first
+        error for which it returns true. In both cases the returned
+        `jsonschema.validators.ErrorStream` releases all per-validation
+        state when it stops, is closed, or is exhausted, and records why
+        it stopped in the last yielded error's
+        `jsonschema.exceptions.ValidationError.context`.
 
         .. deprecated:: v4.0.0
 

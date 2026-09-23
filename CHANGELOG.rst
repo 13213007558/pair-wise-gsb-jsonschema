@@ -1,3 +1,10 @@
+v4.26.0
+=======
+
+* Add optional ``limit`` and ``stop`` arguments to ``Validator.iter_errors``, which now returns a closable ``jsonschema.ErrorStream``.
+  Limits are enforced while errors are generated (not by slicing afterwards), and the stream guarantees that resolver scopes, pending keyword generators and other per-run state are released whenever iteration ends early -- whether via the limit or stop predicate, ``break``/``close()``, an exception, or garbage collection -- so reused validators never carry annotations or context into their next call.
+  When the stream stops early, the last yielded error's ``context`` explains why it was truncated.
+
 v4.25.1
 =======
 

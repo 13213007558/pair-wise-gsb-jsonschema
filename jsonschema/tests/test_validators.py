@@ -1931,6 +1931,321 @@ class AntiDraft6LeakMixin:
         self.assertNotIsInstance(e.exception, exceptions.ValidationError)
 
 
+class TestErrorStream(TestCase):
+    def setUp(self):
+        self.addCleanup(self.assertEqual, validators.ErrorStream.active, 0)
+        self.schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "string"},
+                "c": {"minimum": 5},
+            },
+            "required": ["x", "y"],
+        }
+        self.instance = {"a": "no", "b": 3, "c": 1}
+        self.validator = validators.Draft202012Validator(self.schema)
+
+    def test_no_options_returns_the_full_stream(self):
+        stream = self.validator.iter_errors(self.instance)
+        self.assertIs(iter(stream), stream)
+
+        errors = list(stream)
+        self.assertEqual(len(errors), 5)
+        self.assertEqual(
+            (stream.yielded, stream.truncated, stream.truncation_reason),
+            (5, False, None),
+        )
+        self.assertTrue(stream.closed)
+        self.assertFalse(any(error.context for error in errors))
+
+    def test_limit(self):
+        stream = self.validator.iter_errors(self.instance, limit=2)
+        errors = list(stream)
+
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(
+            (stream.yielded, stream.truncated, stream.truncation_reason),
+            (2, True, "limit"),
+        )
+        self.assertTrue(stream.closed)
+
+    def test_limit_is_enforced_at_the_generation_boundary(self):
+        generated = []
+
+        def counting(validator, value, instance, schema):
+            for each in range(value):
+                generated.append(each)
+                yield exceptions.ValidationError(f"error {each}")
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"counting": counting},
+        )
+        validator = Validator({"counting": 5})
+
+        errors = list(validator.iter_errors({}, limit=2))
+        self.assertEqual(len(errors), 2)
+        # One lookahead error is generated to detect the truncation, but
+        # the remaining errors are never generated at all.
+        self.assertEqual(generated, [0, 1, 2])
+
+        generated.clear()
+        self.assertEqual(len(list(validator.iter_errors({}))), 5)
+        self.assertEqual(generated, [0, 1, 2, 3, 4])
+
+    def test_limit_of_zero(self):
+        stream = self.validator.iter_errors(self.instance, limit=0)
+        self.assertEqual(list(stream), [])
+        self.assertEqual(
+            (stream.yielded, stream.truncated, stream.truncation_reason),
+            (0, True, "limit"),
+        )
+
+    def test_limit_above_the_error_count_does_not_truncate(self):
+        stream = self.validator.iter_errors(self.instance, limit=10)
+        self.assertEqual(len(list(stream)), 5)
+        self.assertFalse(stream.truncated)
+        self.assertIsNone(stream.truncation_reason)
+
+    def test_limit_equal_to_the_error_count_does_not_truncate(self):
+        stream = self.validator.iter_errors(self.instance, limit=5)
+        self.assertEqual(len(list(stream)), 5)
+        self.assertFalse(stream.truncated)
+
+    def test_limit_must_be_a_non_negative_int(self):
+        with self.assertRaises(TypeError):
+            self.validator.iter_errors(self.instance, limit="2")
+        with self.assertRaises(TypeError):
+            self.validator.iter_errors(self.instance, limit=True)
+        with self.assertRaises(ValueError):
+            self.validator.iter_errors(self.instance, limit=-1)
+
+    def test_stop_must_be_callable(self):
+        with self.assertRaises(TypeError):
+            self.validator.iter_errors(self.instance, stop=42)
+
+    def test_stop_predicate(self):
+        stream = self.validator.iter_errors(
+            self.instance,
+            stop=lambda error: error.validator == "required",
+        )
+        errors = list(stream)
+
+        self.assertEqual(len(errors), 4)
+        self.assertEqual(errors[-1].validator, "required")
+        self.assertEqual(
+            (stream.truncated, stream.truncation_reason),
+            (True, "stop"),
+        )
+
+    def test_stop_predicate_which_never_matches(self):
+        stream = self.validator.iter_errors(
+            self.instance, stop=lambda error: False,
+        )
+        self.assertEqual(len(list(stream)), 5)
+        self.assertFalse(stream.truncated)
+
+    def test_stop_predicate_and_limit_together(self):
+        stream = self.validator.iter_errors(
+            self.instance,
+            limit=2,
+            stop=lambda error: error.validator == "required",
+        )
+        errors = list(stream)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(stream.truncation_reason, "limit")
+
+    def test_stop_predicate_raising_cleans_up(self):
+        def boom(error):
+            raise RuntimeError("boom")
+
+        stream = self.validator.iter_errors(self.instance, stop=boom)
+        with self.assertRaises(RuntimeError):
+            list(stream)
+        self.assertTrue(stream.closed)
+
+    def test_truncation_is_explained_in_the_last_errors_context(self):
+        stream = self.validator.iter_errors(self.instance, limit=2)
+        errors = list(stream)
+
+        note, = errors[-1].context
+        self.assertIs(note.parent, errors[-1])
+        self.assertIn("truncated", note.message)
+        self.assertIn("limit of 2", note.message)
+        self.assertFalse(errors[0].context)
+
+    def test_stop_truncation_is_explained_in_the_last_errors_context(self):
+        stream = self.validator.iter_errors(
+            self.instance, stop=lambda error: True,
+        )
+        error, = list(stream)
+
+        note, = error.context
+        self.assertIn("stop predicate", note.message)
+
+    def test_limited_errors_are_a_prefix_of_the_full_stream(self):
+        full = [
+            error.message
+            for error in self.validator.iter_errors(self.instance)
+        ]
+        limited = self.validator.iter_errors(self.instance, limit=3)
+        self.assertEqual(
+            [error.message for error in limited],
+            full[:3],
+        )
+
+    def test_close_releases_resources(self):
+        stream = self.validator.iter_errors(self.instance)
+        next(stream)
+        self.assertEqual(validators.ErrorStream.active, 1)
+
+        stream.close()
+        self.assertTrue(stream.closed)
+        self.assertEqual(validators.ErrorStream.active, 0)
+        self.assertIsNone(stream._validator)
+        self.assertIsNone(stream._errors)
+
+        stream.close()  # closing twice is fine
+        with self.assertRaises(StopIteration):
+            next(stream)
+
+    def test_breaking_out_of_iteration_and_closing(self):
+        stream = self.validator.iter_errors(self.instance)
+        next(stream)
+        self.assertFalse(stream.closed)
+        stream.close()
+        self.assertTrue(stream.closed)
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_streams_are_context_managers(self):
+        with self.validator.iter_errors(self.instance) as stream:
+            next(stream)
+        self.assertTrue(stream.closed)
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_abandoned_streams_are_closed_by_garbage_collection(self):
+        import gc
+
+        stream = self.validator.iter_errors(self.instance)
+        next(stream)
+        self.assertEqual(validators.ErrorStream.active, 1)
+
+        del stream
+        gc.collect()
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_exceptions_during_iteration_clean_up(self):
+        def boom(validator, value, instance, schema):
+            yield exceptions.ValidationError("first")
+            raise RuntimeError("boom")
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"boom": boom},
+        )
+        validator = Validator({"boom": True})
+
+        stream = validator.iter_errors({})
+        with self.assertRaises(RuntimeError):
+            list(stream)
+        self.assertTrue(stream.closed)
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_legacy_resolver_scopes_are_restored(self):
+        schema = {
+            "$id": "http://example.com/root",
+            "properties": {
+                "a": {"$id": "sub", "type": "integer"},
+                "b": {"$id": "sub2", "type": "integer"},
+            },
+        }
+        resolver = validators._RefResolver.from_schema(schema)
+        validator = validators.Draft7Validator(schema, resolver=resolver)
+        instance = {"a": 1.5, "b": 2.5}
+
+        depth = len(resolver._scopes_stack)
+        for limit in [1, None]:
+            with self.subTest(limit=limit):
+                stream = validator.iter_errors(instance, limit=limit)
+                next(stream)
+                self.assertGreater(len(resolver._scopes_stack), depth)
+                stream.close()
+                self.assertEqual(len(resolver._scopes_stack), depth)
+
+        # Even full exhaustion restores the scopes the run entered.
+        list(validator.iter_errors(instance))
+        self.assertEqual(len(resolver._scopes_stack), depth)
+
+    def test_repeated_calls_do_not_carry_over_state(self):
+        expected = [
+            error.message
+            for error in self.validator.iter_errors(self.instance)
+        ]
+        for _ in range(3):
+            limited = self.validator.iter_errors(self.instance, limit=1)
+            self.assertEqual(len(list(limited)), 1)
+            again = [
+                error.message
+                for error in self.validator.iter_errors(self.instance)
+            ]
+            self.assertEqual(again, expected)
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_thread_reuse_does_not_carry_over_state(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        expected = [
+            error.message
+            for error in self.validator.iter_errors(self.instance)
+        ]
+
+        def first_error_message():
+            with self.validator.iter_errors(self.instance, limit=1) as stream:
+                return next(stream).message
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            messages = list(
+                pool.map(lambda _: first_error_message(), range(5)),
+            )
+
+        self.assertEqual(messages, [expected[0]] * 5)
+        self.assertEqual(validators.ErrorStream.active, 0)
+
+    def test_branch_selection_and_annotations_survive_limits(self):
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "anyOf": [{"required": ["a"]}],
+            "unevaluatedProperties": False,
+        }
+        instance = {"a": "wrong", "extra": 1}
+        validator = validators.Draft202012Validator(schema)
+
+        full = [error.message for error in validator.iter_errors(instance)]
+        self.assertEqual(len(full), 2)
+        self.assertIn(
+            "unevaluatedProperties",
+            [error.validator for error in validator.iter_errors(instance)],
+        )
+
+        for limit in [1, 2, 3]:
+            with self.subTest(limit=limit):
+                limited = validator.iter_errors(instance, limit=limit)
+                self.assertEqual(
+                    [error.message for error in limited],
+                    full[:limit],
+                )
+
+    def test_oneOf_context_is_intact_when_limited(self):
+        schema = {"oneOf": [{"type": "integer"}, {"type": "string"}]}
+        validator = validators.Draft202012Validator(schema)
+
+        error, = validator.iter_errors(1.5, limit=1)
+        self.assertEqual(error.validator, "oneOf")
+        self.assertEqual(len(error.context), 2)
+
+
 class TestDraft3Validator(AntiDraft6LeakMixin, ValidatorTestMixin, TestCase):
     Validator = validators.Draft3Validator
     valid: tuple[dict, dict] = ({}, {})

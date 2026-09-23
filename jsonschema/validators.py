@@ -41,6 +41,212 @@ _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
 
 
+class ErrorStream:
+    """
+    A closable iterator over the errors of a single validation run.
+
+    Returned by `Validator.iter_errors`. Besides plain iteration, a stream:
+
+    * stops generating new errors as soon as `limit` errors have been
+      yielded (when a limit was provided), enforcing the limit at the
+      error generation boundary rather than slicing a fully generated
+      list of errors afterwards,
+    * stops after yielding the first error for which the `stop`
+      predicate returned true (when one was provided),
+    * guarantees that all per-run state is released when the stream is
+      closed, is exhausted, raises, or is garbage collected -- pending
+      keyword generators are closed (releasing the resolvers, dynamic
+      scopes and format checkers they reference) and any legacy
+      `jsonschema.RefResolver` scopes entered during the run are
+      popped again, so a reused validator never carries annotations,
+      context or resolution state over into its next `iter_errors`
+      call, and
+    * supports the context manager protocol as well as an idempotent
+      `close` method for deterministic cleanup.
+
+    When the stream stops early, the last yielded error's
+    `jsonschema.exceptions.ValidationError.context` gains a final note
+    explaining why the stream was truncated.
+
+    Attributes:
+
+        yielded (int):
+
+            the number of errors the stream has yielded so far
+
+        truncated (bool):
+
+            whether the stream ended even though the validator had
+            further errors to report
+
+        truncation_reason (str | None):
+
+            `"limit"`, `"stop"`, or `None` if the stream was not
+            (or has not yet been) truncated
+
+        closed (bool):
+
+            whether the stream has been closed and its resources released
+
+    The `ErrorStream.active` class attribute counts streams which have
+    been created but not yet closed, and can be used to compare resource
+    usage between runs (e.g. to assert that early termination does not
+    leak per-run state).
+
+    """
+
+    active = 0
+
+    def __init__(self, validator, errors, limit=None, stop=None):
+        self._limit = limit
+        self._stop = stop
+        self._yielded = 0
+        self._truncated = False
+        self._truncation_reason = None
+        self._last_error = None
+        self._validator = validator
+        self._errors = errors
+        resolver = getattr(validator, "_ref_resolver", None)
+        scopes = getattr(resolver, "_scopes_stack", None)
+        self._resolver_scope_depth = (
+            len(scopes) if scopes is not None else None
+        )
+        self._runner = self._run()
+        self._closed = False
+        type(self).active += 1
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        try:
+            error = next(self._runner)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            self.close()
+            raise
+        self._yielded += 1
+        self._last_error = error
+        return error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            if not getattr(self, "_closed", True):
+                self.close()
+
+    @property
+    def yielded(self):
+        """The number of errors the stream has yielded so far."""
+        return self._yielded
+
+    @property
+    def truncated(self):
+        """Whether the stream stopped with errors left ungenerated."""
+        return self._truncated
+
+    @property
+    def truncation_reason(self):
+        """Why the stream was truncated: "limit", "stop" or None."""
+        return self._truncation_reason
+
+    @property
+    def closed(self):
+        """Whether the stream has been closed and its state released."""
+        return self._closed
+
+    def close(self):
+        """
+        Close the stream, releasing all per-run state it holds.
+
+        Does nothing if the stream is already closed.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            runner, self._runner = self._runner, None
+            if runner is not None:
+                runner.close()
+        finally:
+            self._release_resources()
+            type(self).active -= 1
+
+    def _release_resources(self):
+        validator, self._validator = self._validator, None
+        self._errors = None
+        self._last_error = None
+        if validator is None:
+            return
+        resolver = getattr(validator, "_ref_resolver", None)
+        scopes = getattr(resolver, "_scopes_stack", None)
+        if scopes is None or self._resolver_scope_depth is None:
+            return
+        # Pop any scopes this run entered (directly or via evolved
+        # validators) but did not exit, restoring the resolver to the
+        # state it had before the stream was created.
+        if len(scopes) > self._resolver_scope_depth:
+            del scopes[self._resolver_scope_depth:]
+
+    def _truncate(self, reason, error=None):
+        self._truncated = True
+        self._truncation_reason = reason
+        if error is None:
+            error = self._last_error
+        if error is None:
+            return
+        if reason == "limit":
+            detail = f"the limit of {self._limit} error(s) was reached"
+        else:
+            detail = "the stop predicate matched this error"
+        note = exceptions.ValidationError(
+            f"error stream truncated: {detail}, "
+            "so any further errors were suppressed",
+        )
+        note.parent = error
+        error.context.append(note)
+
+    def _run(self):
+        errors = self._errors
+        limit = self._limit
+        stop = self._stop
+        try:
+            while True:
+                error = next(errors, None)
+                if error is None:
+                    return
+                if stop is not None and stop(error):
+                    self._truncate("stop", error)
+                    yield error
+                    return
+                if limit is None or self._yielded < limit - 1:
+                    yield error
+                    continue
+                if self._yielded >= limit:
+                    # Nothing may be yielded (i.e. limit is 0), but the
+                    # error we just pulled proves truncation happened.
+                    self._truncate("limit")
+                    return
+                # This is the last error we may yield. Peek one error
+                # ahead to learn whether anything is being suppressed.
+                if next(errors, None) is not None:
+                    self._truncate("limit", error)
+                yield error
+                return
+        finally:
+            errors.close()
+
+
 def __getattr__(name):
     if name == "ErrorTree":
         warnings.warn(
@@ -347,7 +553,45 @@ def create(
 
             return NewValidator(**changes)
 
-        def iter_errors(self, instance, _schema=None):
+        def iter_errors(
+            self, instance, _schema=None, *, limit=None, stop=None,
+        ):
+            """
+            Lazily yield each of the validation errors in the instance.
+
+            Arguments:
+
+                instance:
+
+                    the instance to validate
+
+                _schema:
+
+                    deprecated, see `Validator.evolve`
+
+                limit (int | None):
+
+                    if provided, at most this many errors are yielded.
+                    The limit is enforced while errors are generated --
+                    once it is reached, no further errors are produced
+                    and the underlying validation state is released.
+
+                stop (collections.abc.Callable | None):
+
+                    if provided, a predicate called with each error
+                    before it is yielded. As soon as it returns true,
+                    that (final) error is yielded and the stream stops,
+                    releasing the underlying validation state.
+
+            Returns:
+
+                `ErrorStream`: a closable iterator over the validation
+                errors. When neither `limit` nor `stop` is provided it
+                yields the complete stream of errors. See `ErrorStream`
+                for the cleanup guarantees it provides when iteration
+                ends early for any reason.
+
+            """
             if _schema is not None:
                 warnings.warn(
                     (
@@ -359,6 +603,28 @@ def create(
                     DeprecationWarning,
                     stacklevel=2,
                 )
+            if limit is not None:
+                if not isinstance(limit, int) or isinstance(limit, bool):
+                    raise TypeError(
+                        f"limit must be an int or None, got {limit!r}",
+                    )
+                if limit < 0:
+                    raise ValueError(
+                        f"limit must be non-negative, got {limit}",
+                    )
+            if stop is not None and not callable(stop):
+                raise TypeError(
+                    f"stop must be callable or None, got {stop!r}",
+                )
+            return ErrorStream(
+                validator=self,
+                errors=self._iter_errors(instance, _schema=_schema),
+                limit=limit,
+                stop=stop,
+            )
+
+        def _iter_errors(self, instance, _schema=None):
+            if _schema is not None:
                 validators = [
                     (self.VALIDATORS[k], k, v)
                     for k, v in applicable_validators(_schema)
@@ -497,7 +763,7 @@ def create(
                 )
                 self = self.evolve(schema=_schema)
 
-            error = next(self.iter_errors(instance), None)
+            error = next(self._iter_errors(instance), None)
             return error is None
 
     evolve_fields = [
