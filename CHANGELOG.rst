@@ -1,6 +1,14 @@
 v4.27.0
 =======
 
+* Add an explicit evaluation entry point: ``jsonschema.evaluate`` (and the
+  ``Validator.evaluate`` method) now evaluate an instance against a schema
+  in a single pass and return a JSON-serializable
+  ``jsonschema.EvaluationNode`` result tree recording each (sub)schema
+  application's instance location, schema (keyword) location, canonical
+  resource location, validity, annotations, and evaluated properties and
+  items, following Draft 2020-12 semantics. ``iter_errors`` behavior is
+  unchanged.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
   ``relevance`` no longer considers an error's position amongst its siblings.

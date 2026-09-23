@@ -10,6 +10,7 @@ for you.
 """
 import warnings
 
+from jsonschema._evaluation import EvaluationNode
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -20,6 +21,7 @@ from jsonschema.validators import (
     Draft7Validator,
     Draft201909Validator,
     Draft202012Validator,
+    evaluate,
     validate,
 )
 
@@ -112,9 +114,11 @@ __all__ = [
     "Draft7Validator",
     "Draft201909Validator",
     "Draft202012Validator",
+    "EvaluationNode",
     "FormatChecker",
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "evaluate",
     "validate",
 ]

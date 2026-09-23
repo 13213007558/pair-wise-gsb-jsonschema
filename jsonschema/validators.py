@@ -22,6 +22,7 @@ import referencing.exceptions
 import referencing.jsonschema
 
 from jsonschema import (
+    _evaluation,
     _format,
     _keywords,
     _legacy_keywords,
@@ -450,6 +451,28 @@ def create(
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
                 raise error
+
+        def evaluate(self, instance):
+            """
+            Evaluate the instance against the schema, returning a result tree.
+
+            Unlike iter_errors, which only reports failures, this performs
+            a single evaluation pass and returns an EvaluationNode tree
+            recording, for every (sub)schema application, its instance
+            location (a JSON Pointer), its schema location (both the
+            call-site keyword location and the canonical location within
+            the schema resource, which differ across references), whether
+            it succeeded, any annotations it produced, and which
+            properties or items it evaluated.
+
+            The tree is JSON-serializable via EvaluationNode.to_dict.
+
+            Annotation and unevaluated-keyword semantics follow
+            Draft 2020-12.
+            """
+            return _evaluation.evaluate(
+                self, instance, specification=specification,
+            )
 
         def is_type(self, instance, type):
             try:
@@ -1332,6 +1355,52 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
     error = exceptions.best_match(validator.iter_errors(instance))
     if error is not None:
         raise error
+
+
+def evaluate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
+    """
+    Evaluate an instance under the given schema, returning a result tree.
+
+    This is the module-level counterpart of the Validator.evaluate
+    method: rather than yielding only failures (as validate and
+    iter_errors do), it returns the root of an EvaluationNode tree
+    recording each (sub)schema application, its validity, its
+    annotations, and the properties and items it evaluated. The tree
+    is JSON-serializable via EvaluationNode.to_dict.
+
+    Arguments:
+
+        instance:
+
+            The instance to evaluate
+
+        schema:
+
+            The schema to evaluate with
+
+        cls (jsonschema.protocols.Validator):
+
+            The class that will be used to evaluate the instance.
+
+    If the cls argument is not provided, the proper validator class
+    is chosen in the same way as for validate.
+
+    Any other provided positional and keyword arguments will be passed
+    on when instantiating the cls.
+
+    Raises:
+
+        jsonschema.exceptions.SchemaError:
+
+            if the schema itself is invalid
+
+    """
+    if cls is None:
+        cls = validator_for(schema)
+
+    cls.check_schema(schema)
+    validator = cls(schema, *args, **kwargs)
+    return validator.evaluate(instance)
 
 
 def validator_for(
