@@ -19,6 +19,19 @@ Creating or Extending Validator Classes
     :noindex:
 
 
+Strictly Preparing Dialects
+---------------------------
+
+.. autofunction:: prepare
+    :noindex:
+
+.. autoclass:: Vocabulary
+    :noindex:
+
+.. autoclass:: PreparedDialect
+    :noindex:
+
+
 Creating Validation Errors
 --------------------------
 

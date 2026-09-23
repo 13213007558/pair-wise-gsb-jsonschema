@@ -303,6 +303,302 @@ class TestCreateAndExtend(TestCase):
         self.assertTrue(Derived(schema).is_valid(37))
 
 
+class TestPrepare(TestCase):
+    def setUp(self):
+        self.addCleanup(
+            self.assertEqual,
+            validators._META_SCHEMAS,
+            dict(validators._META_SCHEMAS),
+        )
+        self.addCleanup(
+            self.assertEqual,
+            validators._VALIDATORS,
+            dict(validators._VALIDATORS),
+        )
+
+        self.meta = "https://example.com/meta/company"
+        self.vocab = "https://example.com/vocab/company"
+        self.meta_schema = {
+            "$id": self.meta,
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                self.vocab: True,
+            },
+        }
+        self.registry = referencing.Registry().with_resource(
+            self.meta,
+            referencing.Resource.from_contents(
+                self.meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+
+    def meta_requiring(self, uri, **vocabularies):
+        meta_schema = {
+            "$id": uri,
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                **vocabularies,
+            },
+        }
+        return (
+            uri,
+            referencing.Resource.from_contents(
+                meta_schema,
+                default_specification=DRAFT202012,
+            ),
+        )
+
+    def test_required_unknown_vocabulary_fails_preparation(self):
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            validators.prepare(
+                {"$schema": self.meta, "type": "integer"},
+                registry=self.registry,
+            )
+        self.assertEqual(cm.exception.vocabularies, (self.vocab,))
+        self.assertEqual(cm.exception.required_by, self.meta)
+        self.assertIn(self.vocab, str(cm.exception))
+        self.assertIn(self.meta, str(cm.exception))
+
+    def test_failure_happens_before_any_instance_keyword_runs(self):
+        calls = []
+
+        def spy(validator, value, instance, schema):
+            calls.append(instance)  # pragma: no cover
+
+        stricter = "https://example.com/meta/stricter"
+        vocabulary = validators.Vocabulary(
+            self.vocab,
+            keywords={"companyKeyword": spy},
+            meta_schemas={stricter},
+        )
+        another = "https://example.com/vocab/other"
+        registry = self.registry.with_resource(
+            *self.meta_requiring(
+                stricter,
+                **{self.vocab: True, another: True},
+            ),
+        )
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            validators.prepare(
+                {"$schema": stricter},
+                registry=registry,
+                vocabularies=[vocabulary],
+            )
+        self.assertEqual(cm.exception.vocabularies, (another,))
+        self.assertEqual(calls, [])
+
+    def test_optional_unknown_vocabulary_is_ignored(self):
+        uri, resource = self.meta_requiring(
+            "https://example.com/meta/optional",
+            **{self.vocab: False},
+        )
+        registry = self.registry.with_resource(uri, resource)
+        prepared = validators.prepare(
+            {"$schema": uri, "type": "integer"},
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid(3))
+        self.assertFalse(prepared.is_valid("3"))
+
+    def test_meta_schemas_differing_only_in_required_flag(self):
+        required = self.meta_requiring(
+            "https://example.com/meta/required",
+            **{self.vocab: True},
+        )
+        optional = self.meta_requiring(
+            "https://example.com/meta/optional",
+            **{self.vocab: False},
+        )
+        registry = self.registry.with_resources([required, optional])
+
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            validators.prepare(
+                {"$schema": required[0]},
+                registry=registry,
+            )
+
+        prepared = validators.prepare(
+            {"$schema": optional[0]},
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid(object()))
+
+    def test_registered_vocabulary_keywords_are_applied(self):
+        def company_keyword(validator, value, instance, schema):
+            if instance != value:
+                yield exceptions.ValidationError("not the company value")
+
+        vocabulary = validators.Vocabulary(
+            self.vocab,
+            keywords={"companyKeyword": company_keyword},
+            meta_schemas={self.meta},
+        )
+        prepared = validators.prepare(
+            {"$schema": self.meta, "companyKeyword": 42},
+            registry=self.registry,
+            vocabularies=[vocabulary],
+        )
+        self.assertTrue(prepared.is_valid(42))
+        self.assertFalse(prepared.is_valid(41))
+        with self.assertRaises(exceptions.ValidationError):
+            prepared.validate(41)
+        self.assertEqual(
+            [error.message for error in prepared.iter_errors(41)],
+            ["not the company value"],
+        )
+
+    def test_preparation_is_reusable(self):
+        prepared = validators.prepare({"type": "integer"})
+        self.assertTrue(prepared.is_valid(3))
+        self.assertFalse(prepared.is_valid("3"))
+        self.assertTrue(prepared.is_valid(4))
+
+    def test_vocabulary_registered_for_other_meta_schema_does_not_count(self):
+        vocabulary = validators.Vocabulary(
+            self.vocab,
+            keywords={"companyKeyword": lambda *args: ()},
+            meta_schemas={"https://example.com/meta/someone-else"},
+        )
+        with self.assertRaises(exceptions.UnsupportedVocabulary):
+            validators.prepare(
+                {"$schema": self.meta},
+                registry=self.registry,
+                vocabularies=[vocabulary],
+            )
+
+    def test_uri_similarity_does_not_imply_support(self):
+        lookalike = "https://example.com/draft/2020-12/vocab/core"
+        uri, resource = self.meta_requiring(
+            "https://example.com/meta/lookalike",
+            **{lookalike: True},
+        )
+        registry = self.registry.with_resource(uri, resource)
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            validators.prepare({"$schema": uri}, registry=registry)
+        self.assertEqual(cm.exception.vocabularies, (lookalike,))
+
+    def test_boolean_schemas_prepare_trivially(self):
+        self.assertTrue(validators.prepare(True).is_valid(37))
+        self.assertFalse(validators.prepare(False).is_valid(37))
+        prepared = validators.prepare(True, registry=self.registry)
+        self.assertTrue(prepared.is_valid(37))
+
+    def test_nested_resource_with_own_dialect_is_checked(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "sub": {
+                    "$id": "https://example.com/sub",
+                    "$schema": self.meta,
+                    "type": "string",
+                },
+            },
+            "$ref": "https://example.com/sub",
+        }
+        with self.assertRaises(exceptions.UnsupportedVocabulary) as cm:
+            validators.prepare(schema, registry=self.registry)
+        self.assertEqual(cm.exception.required_by, self.meta)
+
+    def test_nested_resource_keywords_are_enforced(self):
+        def company_keyword(validator, value, instance, schema):
+            if instance != value:
+                yield exceptions.ValidationError("not the company value")
+
+        vocabulary = validators.Vocabulary(
+            self.vocab,
+            keywords={"companyKeyword": company_keyword},
+            meta_schemas={self.meta},
+        )
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "sub": {
+                    "$id": "https://example.com/sub",
+                    "$schema": self.meta,
+                    "companyKeyword": 42,
+                },
+            },
+            "$ref": "https://example.com/sub",
+        }
+        prepared = validators.prepare(
+            schema,
+            registry=self.registry,
+            vocabularies=[vocabulary],
+        )
+        self.assertTrue(prepared.is_valid(42))
+        self.assertFalse(prepared.is_valid(41))
+
+    def test_custom_dialect_found_via_registry(self):
+        uri, resource = self.meta_requiring(
+            "https://example.com/meta/plain",
+        )
+        registry = self.registry.with_resource(uri, resource)
+        prepared = validators.prepare(
+            {"$schema": uri, "type": "integer"},
+            registry=registry,
+        )
+        self.assertTrue(prepared.is_valid(3))
+        self.assertFalse(prepared.is_valid("3"))
+        self.assertNotIn(uri, validators._META_SCHEMAS)
+        self.assertNotIn(uri, validators._VALIDATORS)
+
+    def test_unknown_dialect_is_an_error(self):
+        with self.assertRaises(referencing.exceptions.NoSuchResource):
+            validators.prepare({"$schema": "https://example.com/nowhere"})
+
+    def test_known_dialects_prepare_without_a_registry(self):
+        prepared = validators.prepare(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "integer",
+            },
+        )
+        self.assertTrue(prepared.is_valid(3))
+        self.assertFalse(prepared.is_valid("3"))
+
+        prepared = validators.prepare({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "integer",
+        })
+        self.assertTrue(prepared.is_valid(3))
+        self.assertFalse(prepared.is_valid("3"))
+
+    def test_composes_with_extend(self):
+        def extra(validator, value, instance, schema):
+            if instance != value:
+                yield exceptions.ValidationError("extra failed")
+
+        Extended = validators.extend(
+            validators.Draft202012Validator,
+            {"extraKeyword": extra},
+        )
+        vocabulary = validators.Vocabulary(
+            self.vocab,
+            keywords={},
+            meta_schemas={self.meta},
+        )
+        prepared = validators.prepare(
+            {"$schema": self.meta, "extraKeyword": 12},
+            registry=self.registry,
+            vocabularies=[vocabulary],
+            default=Extended,
+        )
+        self.assertTrue(prepared.is_valid(12))
+        self.assertFalse(prepared.is_valid(13))
+
+    def test_direct_construction_stays_compatible(self):
+        Validator = validators.create(
+            meta_schema=self.meta_schema,
+            validators={
+                "type": validators.Draft202012Validator.VALIDATORS["type"],
+            },
+        )
+        validator = Validator({"type": "integer"})
+        self.assertTrue(validator.is_valid(3))
+        self.assertFalse(validator.is_valid("3"))
+
+
 class TestValidationErrorMessages(TestCase):
     def message_for(self, instance, schema, *args, **kwargs):
         cls = kwargs.pop("cls", validators._LATEST_VERSION)

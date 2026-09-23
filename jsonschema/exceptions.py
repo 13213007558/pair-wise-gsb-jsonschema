@@ -223,6 +223,38 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+class UnsupportedVocabulary(Exception):
+    """
+    A meta-schema requires a vocabulary with no known implementation.
+
+    Raised by `jsonschema.validators.prepare` when a dialect selected for
+    a schema declares a vocabulary as required (via :kw:`$vocabulary`)
+    but no implementation of that vocabulary is available.
+
+    Attributes:
+
+        vocabularies (tuple[str]):
+
+            the URIs of the required vocabularies which have no
+            implementation
+
+        required_by (str):
+
+            the URI of the (meta-schema) resource whose
+            :kw:`$vocabulary` keyword requires the missing vocabularies
+
+    """
+
+    def __init__(self, vocabularies, required_by):
+        self.vocabularies = tuple(vocabularies)
+        self.required_by = required_by
+        missing = ", ".join(sorted(self.vocabularies))
+        super().__init__(
+            f"the meta-schema {required_by!r} requires vocabularies "
+            f"which have no known implementation: {missing}",
+        )
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

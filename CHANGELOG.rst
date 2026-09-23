@@ -1,3 +1,10 @@
+Unreleased
+==========
+
+* Add ``jsonschema.validators.prepare``, a strict dialect preparation entry point.
+  Preparing a schema confirms that every vocabulary required (via ``$vocabulary``) by the applicable meta-schema(s) -- including custom dialects found via a ``referencing.Registry`` and nested resources with their own ``$schema`` -- has a known implementation, raising ``jsonschema.exceptions.UnsupportedVocabulary`` before any instance is validated otherwise.
+  Applications explicitly register vocabulary implementations with the new ``jsonschema.validators.Vocabulary``, whose keywords are composed into the prepared validator via ``jsonschema.validators.extend``.
+
 v4.27.0
 =======
 
