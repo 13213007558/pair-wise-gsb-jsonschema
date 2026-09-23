@@ -1,3 +1,10 @@
+v4.28.0
+=======
+
+* Add ``jsonschema.content``, an explicitly opt-in extension which enforces the ``contentEncoding`` / ``contentMediaType`` / ``contentSchema`` keywords for ``base64``-encoded ``application/json`` content strings via ``jsonschema.content.extend_with_content_validation``.
+  Decoding is strict (invalid padding, invalid UTF-8 and duplicate JSON keys are each distinctly reported) and bounded by configurable decoding-depth and decoded-byte limits, and decoded-content failures are raised as ``jsonschema.content.ContentValidationError``, a ``ValidationError`` subclass.
+  Without opting in, the keywords remain mere annotations, as specified.
+
 v4.27.0
 =======
 

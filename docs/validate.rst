@@ -307,3 +307,43 @@ Since in most cases "validating" an email address is an attempt instead to confi
 The same applies to the ``idn-email`` format.
 
 If you indeed want a particular well-specified set of emails to be considered valid, you can use `FormatChecker.checks` to provide your specific definition.
+
+Validating Content
+------------------
+
+JSON Schema defines the :kw:`contentEncoding`, :kw:`contentMediaType` and :kw:`contentSchema` keywords as *annotations*, so by default they are ignored during validation.
+
+If you want to opt in to enforcing them, `jsonschema.content.extend_with_content_validation` creates a validator class which strictly decodes ``base64`` content strings, parses ``application/json`` content as UTF-8 JSON (rejecting duplicate object keys), and validates the decoded document against the :kw:`contentSchema`:
+
+.. doctest::
+
+    >>> import base64, json
+    >>> from jsonschema import Draft202012Validator
+    >>> from jsonschema.content import (
+    ...     ContentValidationError, extend_with_content_validation,
+    ... )
+
+    >>> ContentValidator = extend_with_content_validation(Draft202012Validator)
+    >>> schema = {
+    ...     "type": "object",
+    ...     "properties": {
+    ...         "payload": {
+    ...             "type": "string",
+    ...             "contentEncoding": "base64",
+    ...             "contentMediaType": "application/json",
+    ...             "contentSchema": {"type": "object", "required": ["id"]},
+    ...         },
+    ...     },
+    ... }
+    >>> payload = base64.b64encode(json.dumps({"name": "x"}).encode()).decode()
+    >>> [error] = ContentValidator(schema).iter_errors({"payload": payload})
+    >>> isinstance(error, ContentValidationError)
+    True
+    >>> error.kind, error.content_pointers
+    ('content-schema', ('',))
+
+Failures within decoded content are raised as `jsonschema.content.ContentValidationError`, a subclass of `jsonschema.ValidationError`, so existing error handling keeps working while callers can still tell the two apart.
+The error's ``path`` locates the encoded string within the original instance, while ``content_pointers`` locates the failure within each layer of decoded content.
+
+Decoding is deliberately strict and bounded: invalid padding, invalid UTF-8, duplicate JSON keys and content exceeding the configured byte limits each produce a distinct ``kind`` of error, nested content shares a maximum decoding depth and a total decoded-byte budget, and instances are never mutated.
+Only ``base64`` and ``application/json`` are interpreted -- no other encoders are invoked, and nothing is ever retrieved from the network.
