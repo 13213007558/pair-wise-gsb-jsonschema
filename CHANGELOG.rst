@@ -3,6 +3,11 @@ v4.25.1
 
 * Fix an incorrect required argument in the ``Validator`` protocol's type annotations (#1396).
 
+v4.26.0
+=======
+
+* Add a configurable reference retrieval policy (``jsonschema.RetrievalPolicy`` and ``jsonschema.RetrievalBudget``) which normalizes URIs, provides per-validation-request budgets (reference depth, documents, bytes, concurrent connections and redirects), tenant-scoped TTL caches, in-flight retrieval de-duplication, cancellation/timeouts with a per-request audit trail, and distinguishable, cause-preserving retrieval and budget errors for ``$ref``, ``$dynamicRef`` and cross-document recursion.
+
 v4.25.0
 =======
 

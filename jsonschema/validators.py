@@ -26,6 +26,7 @@ from jsonschema import (
     _format,
     _keywords,
     _legacy_keywords,
+    _references,
     _types,
     _typing,
     _utils,
@@ -132,6 +133,32 @@ def _warn_for_remote_retrieve(uri: str):
 _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
     referencing.Registry(retrieve=_warn_for_remote_retrieve),  # type: ignore[call-arg]
 )
+
+
+def _find_policy_error(error):
+    """
+    Find a retrieval-policy error wrapped in an exception chain.
+
+    The referencing package wraps arbitrary retriever exceptions in
+    `referencing.exceptions.Unretrievable` / ``Unresolvable``; walk the
+    cause chain so budget, cancellation, timeout or media-type errors raised
+    by a `RetrievalPolicy` remain distinguishable and preserve their cause.
+    """
+    seen = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, exceptions._ReferencingError):
+            return current
+        pending.extend(
+            each
+            for each in (current.__cause__, current.__context__)
+            if each is not None and id(each) not in seen
+        )
+    return None
 
 
 def create(
@@ -241,6 +268,12 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _retrieval_policy = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+            alias="retrieval_policy",
+        )
         _resolver = field(
             alias="_resolver",
             default=None,
@@ -283,7 +316,15 @@ def create(
         def __attrs_post_init__(self):
             if self._resolver is None:
                 registry = self._registry
-                if registry is not _REMOTE_WARNING_REGISTRY:
+                policy = self._retrieval_policy
+                if policy is not None:
+                    # Coordinate retrieval with the configured policy: the
+                    # registry keeps its resources/anchors, but dynamic
+                    # retrieval is budgeted, normalized and cached.
+                    registry = SPECIFICATIONS.combine(
+                        policy.configure_registry(registry),
+                    )
+                elif registry is not _REMOTE_WARNING_REGISTRY:
                     registry = SPECIFICATIONS.combine(registry)
                 resource = specification.create_resource(self.schema)
                 self._resolver = registry.resolver_with_root(resource)
@@ -334,6 +375,7 @@ def create(
                 self._ref_resolver = _RefResolver.from_schema(
                     self.schema,
                     id_of=id_of,
+                    retrieval_policy=self._retrieval_policy,
                 )
             return self._ref_resolver
 
@@ -348,6 +390,7 @@ def create(
             return NewValidator(**changes)
 
         def iter_errors(self, instance, _schema=None):
+            policy = self._retrieval_policy
             if _schema is not None:
                 warnings.warn(
                     (
@@ -359,6 +402,14 @@ def create(
                     DeprecationWarning,
                     stacklevel=2,
                 )
+            if policy is None or _references.current_request() is not None:
+                yield from self._iter_errors_body(instance, _schema=_schema)
+                return
+            with policy.request():
+                yield from self._iter_errors_body(instance, _schema=_schema)
+
+        def _iter_errors_body(self, instance, _schema=None):
+            if _schema is not None:
                 validators = [
                     (self.VALIDATORS[k], k, v)
                     for k, v in applicable_validators(_schema)
@@ -459,16 +510,61 @@ def create(
 
         def _validate_reference(self, ref, instance):
             if self._ref_resolver is None:
-                try:
-                    resolved = self._resolver.lookup(ref)
-                except referencing.exceptions.Unresolvable as err:
-                    raise exceptions._WrappedReferencingError(err) from err
+                policy = self._retrieval_policy
+                if policy is None:
+                    try:
+                        resolved = self._resolver.lookup(ref)
+                    except referencing.exceptions.Unresolvable as err:
+                        raise exceptions._WrappedReferencingError(err) from err
 
-                return self.descend(
-                    instance,
-                    resolved.contents,
-                    resolver=resolved.resolver,
-                )
+                    return self.descend(
+                        instance,
+                        resolved.contents,
+                        resolver=resolved.resolver,
+                    )
+
+                error = self._check_reference_budget(ref, instance)
+                if error is not None:
+                    return iter((error,))
+
+                def policy_reference_errors():
+                    stack = _references._reference_stack.get()
+                    token = _references._reference_stack.set(
+                        stack
+                        + (self._reference_stack_entry(ref, instance),),
+                    )
+                    try:
+                        try:
+                            resolved = self._resolver.lookup(ref)
+                        except referencing.exceptions.Unresolvable as err:
+                            reference_error = _find_policy_error(err)
+                            if reference_error is not None:
+                                yield self._reference_validation_error(
+                                    ref=ref,
+                                    instance=instance,
+                                    cause=reference_error,
+                                )
+                                return
+                            raise exceptions._WrappedReferencingError(
+                                err,
+                            ) from err
+                        except exceptions._ReferencingError as err:
+                            yield self._reference_validation_error(
+                                ref=ref,
+                                instance=instance,
+                                cause=err,
+                            )
+                            return
+
+                        yield from self.descend(
+                            instance,
+                            resolved.contents,
+                            resolver=resolved.resolver,
+                        )
+                    finally:
+                        _references._reference_stack.reset(token)
+
+                return policy_reference_errors()
             else:
                 resolve = getattr(self._ref_resolver, "resolve", None)
                 if resolve is None:
@@ -482,6 +578,99 @@ def create(
                         return list(self.descend(instance, resolved))
                     finally:
                         self._ref_resolver.pop_scope()
+
+        def _reference_stack_entry(self, ref, instance):
+            """
+            Build a per-branch stack entry used to detect non-termination.
+
+            The entry identifies the targeted document (by normalized URI),
+            the fragment (so different anchors remain distinguishable),
+            whether the reference is dynamic (``$dynamicRef`` may resolve to
+            different resources along the dynamic scope) and the instance by
+            identity: a recursive schema validating shrinking instances is
+            valid, but revisiting the exact same object cannot terminate.
+            """
+            if ref.startswith("#"):
+                document_uri = self._resolver._base_uri
+                fragment = ref[1:]
+            else:
+                document_uri, fragment = urldefrag(
+                    urljoin(self._resolver._base_uri, ref),
+                )
+            try:
+                normalized = _references.normalize_uri(document_uri)
+            except exceptions.InvalidReference:
+                normalized = document_uri
+            dynamic = isinstance(
+                self.schema,
+                Mapping,
+            ) and "$dynamicRef" in self.schema
+            return normalized, fragment, id(instance), dynamic
+
+        def _check_reference_budget(self, ref, instance):
+            policy = self._retrieval_policy
+            request = _references.current_request()
+            if request is None:
+                return None
+            budget = request.budget
+            entry = self._reference_stack_entry(ref, instance)
+            stack = _references._reference_stack.get()
+            depth = len(stack) + 1
+
+            if budget.max_depth is not None and depth > budget.max_depth:
+                cause = exceptions.MaxDepthExceeded(
+                    ref,
+                    limit=budget.max_depth,
+                    depth=depth,
+                )
+                return self._reference_validation_error(
+                    ref=ref,
+                    instance=instance,
+                    cause=cause,
+                )
+
+            # A non-dynamic ref which revisits the same document/fragment for
+            # the very same instance cannot make progress. Dynamic refs are
+            # only treated as cyclic if the same ref target recurs (their
+            # resolution legitimately changes with the dynamic scope).
+            non_dynamic = [
+                (uri, fragment, identity)
+                for uri, fragment, identity, dynamic in stack
+                if not dynamic
+            ]
+            key = (entry[0], entry[1], entry[2])
+            if key in non_dynamic:
+                chain = [each[0] for each in stack] + [entry[0]]
+                cause = exceptions.CyclicReferenceError(
+                    ref,
+                    limit=budget.max_cycle or len(chain),
+                    chain=chain,
+                )
+                return self._reference_validation_error(
+                    ref=ref,
+                    instance=instance,
+                    cause=cause,
+                )
+            return None
+
+        def _reference_validation_error(self, *, ref, instance, cause):
+            message = str(cause)
+            error = exceptions.ValidationError(
+                message,
+                validator="$ref",
+                validator_value=ref,
+                instance=instance,
+                schema=self.schema,
+                cause=cause,
+            )
+            error._set(
+                validator="$ref",
+                validator_value=ref,
+                instance=instance,
+                schema=self.schema,
+                type_checker=self.TYPE_CHECKER,
+            )
+            return error
 
         def is_valid(self, instance, _schema=None):
             if _schema is not None:
@@ -927,6 +1116,7 @@ class _RefResolver:
         handlers=(),
         urljoin_cache=None,
         remote_cache=None,
+        retrieval_policy=None,
     ):
         if urljoin_cache is None:
             urljoin_cache = lru_cache(1024)(urljoin)
@@ -936,6 +1126,7 @@ class _RefResolver:
         self.referrer = referrer
         self.cache_remote = cache_remote
         self.handlers = dict(handlers)
+        self.retrieval_policy = retrieval_policy
 
         self._scopes_stack = [base_uri]
 
@@ -1210,6 +1401,39 @@ class _RefResolver:
         .. _requests: https://pypi.org/project/requests/
 
         """
+        policy = self.retrieval_policy
+        if policy is not None:
+            # The deprecated compatibility entry point must not silently bypass
+            # normalization, caching, cancellation or resource budgets.
+            request = _references.current_request()
+            if request is None:
+                context = policy.request()
+            else:
+                context = contextlib.nullcontext(request)
+            def fallback(missing):
+                return self._retrieve_uncached(missing)
+
+            with context:
+                try:
+                    resource, _canonical = policy.retrieve_resource(
+                        uri,
+                        fallback=fallback,
+                    )
+                except exceptions._ReferencingError as error:
+                    raise exceptions._RefResolutionError(error) from error
+                result = resource.contents
+                if self.cache_remote:
+                    normalized = _references.normalize_uri(uri)
+                    self.store[uri] = result
+                    if _canonical != normalized:
+                        self.store[_canonical] = result
+                return result
+        result = self._retrieve_uncached(uri)
+        if self.cache_remote:
+            self.store[uri] = result
+        return result
+
+    def _retrieve_uncached(self, uri):
         try:
             import requests
         except ImportError:
@@ -1227,9 +1451,6 @@ class _RefResolver:
             # Otherwise, pass off to urllib and assume utf-8
             with urlopen(uri) as url:  # noqa: S310
                 result = json.loads(url.read().decode("utf-8"))
-
-        if self.cache_remote:
-            self.store[uri] = result
         return result
 
 

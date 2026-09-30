@@ -388,3 +388,71 @@ Other Key Functional Differences
 
 Whilst `_RefResolver` *did* automatically retrieve remote references (against the recommendation of the spec, and in a way which therefore could lead to questionable security concerns when combined with untrusted schemas), `referencing.Registry` does *not* do so.
 If you rely on this behavior, you should follow the `above example of retrieving resources over HTTP <http>`.
+
+
+Retrieval Policies, Budgets and Multi-Tenant Caching
+-----------------------------------------------------
+
+When validating untrusted schemas in a multi-tenant service, plain
+`referencing.Registry` retrieval is intentionally minimal: it does not
+normalize cache keys beyond fragment stripping, coordinate in-flight
+requests, bound resource usage, or isolate caches.
+`jsonschema.RetrievalPolicy` provides a configurable layer on top of a
+registry retriever which coordinates all of these concerns.
+
+A policy is typically constructed once per tenant, with a retriever, a
+`jsonschema.RetrievalBudget`, an optional TTL and timeout, and then passed
+to a validator alongside a registry:
+
+.. code:: python
+
+    from referencing import Registry
+    from jsonschema import Draft202012Validator, RetrievalPolicy
+    from jsonschema import RetrievalBudget
+
+    def retrieve(uri, request):
+        # request.context is per-validation request state (e.g. a trace id)
+        return fetch_schema_for_tenant(uri, request.context)
+
+    policy = RetrievalPolicy(
+        retrieve,
+        tenant="tenant-a",
+        ttl=300,
+        timeout=10,
+        budget=RetrievalBudget(
+            max_depth=32,
+            max_documents=64,
+            max_bytes=8 * 1024 * 1024,
+            max_connections=8,
+            max_redirects=5,
+        ),
+    )
+    validator = Draft202012Validator(
+        schema,
+        registry=Registry(),
+        retrieval_policy=policy,
+    )
+
+The policy guarantees that:
+
+* URIs are normalized (fragment, case, default port) before caching;
+* each validation gets its own request with isolated budget counters, an
+  audit trail (``request.audit()``) and cooperative cancellation
+  (``request.cancel()``);
+* concurrent references in the same request share a single in-flight
+  retrieval per normalized URI, while validator instances remain
+  immutable and per-request state is never shared;
+* successful documents are cached per tenant, with TTL expiry and explicit
+  ``RetrievalPolicy.invalidate``, and distinct policies (tenants) never
+  share caches;
+* redirects, media types, depth, document count, byte count, connection
+  count and cyclic references raise distinguishable errors
+  (``jsonschema.exceptions.BudgetExceeded`` subclasses,
+  ``ReferenceRetrievalError``, ``UnsupportedMediaType``,
+  ``ReferenceTimeout`` and ``ReferenceCancelled``), each retaining the
+  originating ``cause``;
+* cancellation, timeout or retrieval failure never writes a partial
+  document into the cache or registry;
+* the deprecated `jsonschema.RefResolver` compatibility entry point also
+  enforces the same budget when a policy is configured, so it cannot be
+  used to bypass retrieval limits.

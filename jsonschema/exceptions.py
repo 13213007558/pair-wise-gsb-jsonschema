@@ -262,6 +262,213 @@ class _WrappedReferencingError(_RefResolutionError, _Unresolvable):  # pragma: n
         return f"{self._wrapped.__class__.__name__}: {self._wrapped}"
 
 
+class _ReferencingError(Exception):
+    """
+    Base class for errors raised by the reference retrieval policy.
+
+    Every reference retrieval error preserves the ``ref`` that triggered it
+    as well as the original ``cause`` (when one exists), so that callers can
+    audit exactly which URI or redirect chain exhausted a resource budget.
+    """
+
+    def __init__(self, message, ref, *, cause=None, **details):
+        super().__init__(message)
+        self.message = message
+        self.ref = ref
+        self.cause = self.__cause__ = cause
+        for name, value in details.items():
+            setattr(self, name, value)
+
+    def __str__(self):
+        return self.message
+
+
+class ReferenceRetrievalError(_ReferencingError):
+    """
+    A remote (or custom) reference could not be retrieved.
+
+    The original exception raised by the configured retriever is preserved
+    as :attr:`cause` and is also available as the chained exception.
+    """
+
+
+class UnsupportedMediaType(ReferenceRetrievalError):
+    """
+    A retrieved document declared a media type rejected by the policy.
+    """
+
+    def __init__(self, message, ref, *, media_type, cause=None):
+        super().__init__(
+            message,
+            ref,
+            cause=cause,
+            media_type=media_type,
+        )
+
+
+class InvalidReference(ReferenceRetrievalError):
+    """
+    A reference (or redirect target) is malformed or cannot be normalized.
+    """
+
+
+class ReferenceCancelled(ReferenceRetrievalError):
+    """
+    A reference retrieval was cancelled via the request cancellation token.
+    """
+
+
+class ReferenceTimeout(ReferenceRetrievalError):
+    """
+    A reference retrieval exceeded the configured per-request timeout.
+    """
+
+
+class BudgetExceeded(_ReferencingError):
+    """
+    A resource budget of the retrieval policy was exhausted.
+
+    Attributes:
+
+        budget:
+            the kind of budget that was exhausted (``"depth"``,
+            ``"documents"``, ``"bytes"``, ``"connections"`` or
+            ``"redirects"``)
+        limit:
+            the configured limit for the exhausted budget
+        used:
+            the observed usage when the budget was exhausted
+    """
+
+    #: Human-readable names of the configurable budgets.
+    DEPTH = "depth"
+    DOCUMENTS = "documents"
+    BYTES = "bytes"
+    CONNECTIONS = "connections"
+    REDIRECTS = "redirects"
+
+    def __init__(
+        self,
+        message,
+        ref,
+        *,
+        budget,
+        limit,
+        used=None,
+        cause=None,
+    ):
+        super().__init__(
+            message,
+            ref,
+            cause=cause,
+            budget=budget,
+            limit=limit,
+            used=used,
+        )
+
+
+class MaxDepthExceeded(BudgetExceeded):
+    """The maximum reference recursion depth was reached."""
+
+    def __init__(self, ref, *, limit, depth):
+        super().__init__(
+            (
+                f"Maximum reference resolution depth of {limit} was "
+                f"exceeded while resolving {ref!r}."
+            ),
+            ref,
+            budget=BudgetExceeded.DEPTH,
+            limit=limit,
+            used=depth,
+        )
+
+
+class CyclicReferenceError(BudgetExceeded):
+    """
+    A non-terminating reference cycle was detected.
+
+    A JSON Schema which recursively validates smaller instances is not
+    considered cyclic; only a chain which would revisit the exact same
+    document, reference and instance (and therefore never terminate) is.
+    """
+
+    def __init__(self, ref, *, limit, chain):
+        chain_text = " -> ".join(repr(each) for each in chain)
+        super().__init__(
+            f"Cyclic reference detected while resolving {ref!r}: {chain_text}",
+            ref,
+            budget="cycle",
+            limit=limit,
+            used=len(chain),
+        )
+        self.chain = list(chain)
+
+
+class DocumentBudgetExceeded(BudgetExceeded):
+    """The maximum number of retrieved documents was reached."""
+
+    def __init__(self, ref, *, limit, documents):
+        super().__init__(
+            (
+                f"Document retrieval budget of {limit} document(s) was "
+                f"exhausted while retrieving {ref!r}."
+            ),
+            ref,
+            budget=BudgetExceeded.DOCUMENTS,
+            limit=limit,
+            used=documents,
+        )
+
+
+class ByteBudgetExceeded(BudgetExceeded):
+    """The maximum aggregate size of retrieved documents was reached."""
+
+    def __init__(self, ref, *, limit, bytes_used, document_size):
+        super().__init__(
+            (
+                f"Byte retrieval budget of {limit} byte(s) was exhausted "
+                f"while retrieving {ref!r} (document of {document_size} "
+                f"byte(s) would bring usage to {bytes_used} byte(s))."
+            ),
+            ref,
+            budget=BudgetExceeded.BYTES,
+            limit=limit,
+            used=bytes_used,
+        )
+        self.document_size = document_size
+
+
+class ConnectionBudgetExceeded(BudgetExceeded):
+    """The maximum number of concurrent retrievals was reached."""
+
+    def __init__(self, ref, *, limit):
+        super().__init__(
+            (
+                f"Connection retrieval budget of {limit} concurrent "
+                f"retrieval(s) was exhausted while retrieving {ref!r}."
+            ),
+            ref,
+            budget=BudgetExceeded.CONNECTIONS,
+            limit=limit,
+        )
+
+
+class RedirectBudgetExceeded(BudgetExceeded):
+    """The maximum number of redirects for a single retrieval was reached."""
+
+    def __init__(self, ref, *, limit, redirects):
+        super().__init__(
+            (
+                f"Redirect retrieval budget of {limit} redirect(s) was "
+                f"exhausted while retrieving {ref!r}."
+            ),
+            ref,
+            budget=BudgetExceeded.REDIRECTS,
+            limit=limit,
+            used=redirects,
+        )
+
+
 class UndefinedTypeCheck(Exception):
     """
     A type checker was asked to check a type it did not have registered.
