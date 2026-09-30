@@ -14,6 +14,7 @@ from warnings import warn
 import contextlib
 import json
 import reprlib
+import threading
 import warnings
 
 from attrs import define, field, fields
@@ -26,6 +27,7 @@ from jsonschema import (
     _format,
     _keywords,
     _legacy_keywords,
+    registry as _registry_module,
     _types,
     _typing,
     _utils,
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
     from jsonschema.protocols import Validator
 
 _UNSET = _utils.Unset()
+_active_reference_cycles = threading.local()
 
 _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
@@ -247,6 +250,18 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _dynamic_snapshot = field(
+            default=None,
+            init=False,
+            repr=False,
+            eq=False,
+        )
+        _dynamic_registry = field(
+            default=None,
+            init=False,
+            repr=False,
+            eq=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -282,10 +297,23 @@ def create(
 
         def __attrs_post_init__(self):
             if self._resolver is None:
-                registry = self._registry
-                if registry is not _REMOTE_WARNING_REGISTRY:
-                    registry = SPECIFICATIONS.combine(registry)
                 resource = specification.create_resource(self.schema)
+                if isinstance(
+                    self._registry,
+                    _registry_module.VersionedRegistry,
+                ):
+                    snapshot = self._dynamic_snapshot
+                    if snapshot is None:
+                        snapshot = self._registry.snapshot(
+                            base_uri=resource.id() or "",
+                        )
+                    registry = SPECIFICATIONS.combine(snapshot.registry)
+                    self._dynamic_registry = self._registry
+                    self._dynamic_snapshot = snapshot
+                else:
+                    registry = self._registry
+                    if registry is not _REMOTE_WARNING_REGISTRY:
+                        registry = SPECIFICATIONS.combine(registry)
                 self._resolver = registry.resolver_with_root(resource)
 
             if self.schema is True or self.schema is False:
@@ -366,6 +394,23 @@ def create(
                 ]
             else:
                 _schema, validators = self.schema, self._validators
+
+            if _schema is not None and self._dynamic_registry is not None:
+                root = specification.create_resource(self.schema)
+                if _schema is self.schema:
+                    snapshot = self._dynamic_registry.snapshot(
+                        base_uri=root.id() or "",
+                    )
+                else:
+                    snapshot = self._dynamic_snapshot
+                combined = SPECIFICATIONS.combine(snapshot.registry)
+                registry = combined.with_resource(root.id() or "", root)
+                pinned = self.evolve(
+                    _resolver=registry.resolver(base_uri=root.id() or ""),
+                )
+                pinned._dynamic_snapshot = snapshot
+                yield from pinned.iter_errors(instance)
+                return
 
             if _schema is True:
                 return
@@ -462,13 +507,52 @@ def create(
                 try:
                     resolved = self._resolver.lookup(ref)
                 except referencing.exceptions.Unresolvable as err:
+                    cause = err.__cause__
+                    while cause is not None:
+                        if isinstance(cause, _registry_module.RegistryError):
+                            raise cause from err
+                        next_cause = cause.__cause__
+                        if next_cause is cause:
+                            break
+                        cause = next_cause
                     raise exceptions._WrappedReferencingError(err) from err
 
-                return self.descend(
+                if ref.startswith("#"):
+                    fragment = ref[1:]
+                    target = self._resolver._base_uri
+                else:
+                    target, fragment = urldefrag(
+                        urljoin(self._resolver._base_uri, ref),
+                    )
+                if fragment:
+                    target = f"{target}#{fragment}"
+                else:
+                    target = target.rstrip("#")
+                active = tuple(getattr(_active_reference_cycles, "stack", ()))
+                key = (target, id(instance))
+                if key in active:
+                    raise _registry_module.ReferenceCycleError(
+                        ref,
+                        tuple(uri for uri, _ in active),
+                    )
+                stack = getattr(_active_reference_cycles, "stack", None)
+                if stack is None:
+                    stack = []
+                    _active_reference_cycles.stack = stack
+                stack.append(key)
+                errors = self.descend(
                     instance,
                     resolved.contents,
                     resolver=resolved.resolver,
                 )
+
+                def unwind_reference(errors=errors):
+                    try:
+                        yield from errors
+                    finally:
+                        stack.pop()
+
+                return unwind_reference()
             else:
                 resolve = getattr(self._ref_resolver, "resolve", None)
                 if resolve is None:

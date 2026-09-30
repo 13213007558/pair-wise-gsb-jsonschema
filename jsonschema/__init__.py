@@ -13,6 +13,17 @@ import warnings
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.registry import (
+    CircularReferenceError,
+    ConcurrentRegistryUpdate,
+    LoadEvent,
+    RegistryError,
+    RegistrySnapshot,
+    ResourceLoadError,
+    Snapshot,
+    UnknownSnapshot,
+    VersionedRegistry,
+)
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -113,8 +124,17 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "CircularReferenceError",
+    "ConcurrentRegistryUpdate",
+    "LoadEvent",
+    "RegistryError",
+    "RegistrySnapshot",
+    "ResourceLoadError",
     "SchemaError",
+    "Snapshot",
     "TypeChecker",
+    "UnknownSnapshot",
+    "VersionedRegistry",
     "ValidationError",
     "validate",
 ]
