@@ -388,3 +388,38 @@ Other Key Functional Differences
 
 Whilst `_RefResolver` *did* automatically retrieve remote references (against the recommendation of the spec, and in a way which therefore could lead to questionable security concerns when combined with untrusted schemas), `referencing.Registry` does *not* do so.
 If you rely on this behavior, you should follow the `above example of retrieving resources over HTTP <http>`.
+
+
+Versioned Registries and Snapshots
+----------------------------------
+
+Long-running services which update their schemas over time face an additional problem: a `referencing.Registry` caches retrieved resources by URI, so once a resource is resolved, later validations keep using the cached copy even if the underlying schema store has changed.
+
+`jsonschema.VersionedRegistry` addresses this with explicit snapshots, versions and invalidation:
+
+.. code-block:: python
+
+    from jsonschema import VersionedRegistry
+
+    registry = VersionedRegistry(retrieve=load_schema_from_somewhere)
+
+    # each validation call (or tenant) pins a snapshot ...
+    snapshot = registry.snapshot()
+    snapshot.validate({"some": "instance"}, {"$ref": "https://example.com/root.json"})
+
+    # ... and after the schema store changes, invalidating makes
+    # *subsequent* snapshots resolve the new resource versions ...
+    registry.invalidate("https://example.com/root.json")
+    new_snapshot = registry.snapshot()
+
+    # ... while the older snapshot keeps serving the old version.
+    snapshot.validate({"some": "instance"}, {"$ref": "https://example.com/root.json"})
+
+The key properties of this API are:
+
+    * a single validation call is always fixed to one snapshot; switching versions happens between calls, never during one
+    * caches are never shared across snapshots or across registry instances, so a cache hit can never serve a resource from the wrong version
+    * `VersionedRegistry.set_resource` and `VersionedRegistry.invalidate` bump the registry's version, and accept an ``expected_version`` argument which raises `jsonschema.exceptions.VersionConflictError` if a concurrent update intervened
+    * resource loading failures raise `jsonschema.exceptions.ResourceLoadError`, and reference cycles raise `jsonschema.exceptions.CircularReferenceError`, rather than silently reusing stale resources
+    * every load is recorded in `VersionedRegistry.load_log` with the snapshot token and registry version, so old and new loads of the same URI can be told apart
+    * snapshots are thread-safe, and support ``copy`` and ``pickle`` (pickling detaches a snapshot from its registry, after which it logs loads locally)

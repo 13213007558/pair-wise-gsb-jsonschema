@@ -215,6 +215,61 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+class RegistrySnapshotError(Exception):
+    """
+    Base class for errors raised by versioned registry snapshots.
+    """
+
+
+class ResourceLoadError(RegistrySnapshotError):
+    """
+    A resource could not be loaded for a registry snapshot.
+    """
+
+    def __init__(self, uri: str, version: int, cause: Exception) -> None:
+        super().__init__(
+            f"failed to load resource {uri!r} for registry snapshot "
+            f"at version {version}: {cause}",
+        )
+        self.uri = uri
+        self.version = version
+        self.cause = cause
+
+
+class CircularReferenceError(RegistrySnapshotError):
+    """
+    A circular reference was detected while resolving references.
+    """
+
+    def __init__(
+        self,
+        uri: str | None = None,
+        chain: Iterable[str] = (),
+    ) -> None:
+        self.uri = uri
+        self.chain = tuple(chain)
+        if self.chain:
+            path = " -> ".join(self.chain)
+            message = f"circular reference detected: {path}"
+        else:
+            message = "circular reference detected"
+        super().__init__(message)
+
+
+class VersionConflictError(RegistrySnapshotError):
+    """
+    A registry was concurrently updated at an unexpected version.
+    """
+
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(
+            f"registry was concurrently modified: expected version "
+            f"{expected}, but current version is {actual}",
+        )
+        self.expected = expected
+        self.actual = actual
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

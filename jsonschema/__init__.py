@@ -11,6 +11,7 @@ for you.
 import warnings
 
 from jsonschema._format import FormatChecker
+from jsonschema._registry import RegistrySnapshot, VersionedRegistry
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import (
@@ -113,8 +114,10 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "RegistrySnapshot",
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "VersionedRegistry",
     "validate",
 ]

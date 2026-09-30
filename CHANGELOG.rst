@@ -1,3 +1,9 @@
+Unreleased
+==========
+
+* Add ``jsonschema.VersionedRegistry`` and ``jsonschema.RegistrySnapshot``, an explicit snapshot/versioning and invalidation layer on top of ``referencing.Registry``.
+  Snapshots pin a registry version for a whole validation call, new snapshots pick up updated or invalidated resources, caches are never shared across snapshots or registry instances, and load failures, circular references and concurrent updates raise identifiable exceptions (``jsonschema.exceptions.ResourceLoadError``, ``jsonschema.exceptions.CircularReferenceError`` and ``jsonschema.exceptions.VersionConflictError``).
+
 v4.25.1
 =======
 
