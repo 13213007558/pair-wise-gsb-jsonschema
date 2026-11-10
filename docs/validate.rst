@@ -307,3 +307,53 @@ Since in most cases "validating" an email address is an attempt instead to confi
 The same applies to the ``idn-email`` format.
 
 If you indeed want a particular well-specified set of emails to be considered valid, you can use `FormatChecker.checks` to provide your specific definition.
+
+.. _discriminator-index:
+
+Faster ``oneOf`` via a candidate index
+--------------------------------------
+
+A :kw:`oneOf` applicator with many branches -- for example a message schema
+whose branches each carry a tagged ``type`` field -- ordinarily checks an
+instance against branches in order until one matches, so a request that
+matches the last branch visits every branch first.
+
+When *every* branch can be proven ahead of time to discriminate on the same
+required property using inline :kw:`const` or :kw:`enum` values, the
+validator builds a candidate index mapping those values to their branches.
+A successful request then validates only the single candidate branch it
+could possibly match, instead of scanning all of them.
+
+The index is conservative and only prunes a branch when it is *provably*
+inapplicable, so it can never hide a second successful branch:
+
+* the discriminating property must be required by every branch (an optional
+  property disables indexing), and every branch must constrain it with an
+  inline :kw:`const` or :kw:`enum`,
+
+* values use JSON Schema equality, so ``true`` and ``1`` (and ``false`` and
+  ``0``) are treated as distinct, and lists and objects are compared
+  structurally,
+
+* when :kw:`enum` / :kw:`const` values overlap between branches, all
+  overlapping branches remain candidates,
+
+* boolean subschemas, non-constant constraints, and references that cannot
+  be statically resolved locally (including :kw:`$dynamicRef` and
+  :kw:`$recursiveRef`) keep the exhaustive behavior.
+
+Anything not provably discriminable -- including an unknown discriminating
+value, a missing discriminating property, and any branch that fails -- is
+validated through the original exhaustive path.  Error messages and their
+full per-branch ``context`` are therefore unchanged, and
+:kw:`unevaluatedProperties` / :kw:`unevaluatedItems` annotations are
+unaffected, since they walk the schema independently of the index.
+
+A cached index is guarded against schemas that are mutated after it is
+built: any in-place change to an indexed applicator invalidates and rebuilds
+the index rather than reusing stale state.  Indexes are retained in a
+bounded LRU cache, so the additional memory is capped.
+
+The optimization is enabled by default and can be turned off by setting the
+``JSONSCHEMA_DISABLE_DISCRIMINATOR_INDEX`` environment variable, which
+restores purely exhaustive :kw:`oneOf` validation.

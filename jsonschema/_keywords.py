@@ -1,6 +1,7 @@
 from fractions import Fraction
 import re
 
+from jsonschema import _discriminator
 from jsonschema._utils import (
     ensure_list,
     equal,
@@ -349,10 +350,19 @@ def anyOf(validator, anyOf, instance, schema):
         )
 
 
-def oneOf(validator, oneOf, instance, schema):
+def _one_of_generic(validator, oneOf, instance):
+    """
+    Exhaustively validate every branch, preserving the original errors.
+
+    This is the unconditional fallback: any situation where a candidate
+    index cannot prove which branches apply (no index, unknown
+    discriminating value, zero or multiple matching branches, ...) is
+    validated here so that error messages and contexts stay identical.
+    """
     subschemas = enumerate(oneOf)
     all_errors = []
     for index, subschema in subschemas:
+        _discriminator._stats["branch_visits"] += 1
         errs = list(validator.descend(instance, subschema, schema_path=index))
         if not errs:
             first_valid = subschema
@@ -363,6 +373,7 @@ def oneOf(validator, oneOf, instance, schema):
             f"{instance!r} is not valid under any of the given schemas",
             context=all_errors,
         )
+        return
 
     more_valid = [
         each
@@ -373,6 +384,71 @@ def oneOf(validator, oneOf, instance, schema):
         more_valid.append(first_valid)
         reprs = ", ".join(repr(schema) for schema in more_valid)
         yield ValidationError(f"{instance!r} is valid under each of {reprs}")
+
+
+def oneOf(validator, oneOf, instance, schema):
+    # The legacy RefResolver has no statically inspectable local registry,
+    # so it always uses the exhaustive path.
+    if validator._ref_resolver is None:
+        index = _discriminator.get_index(
+            oneOf=oneOf,
+            containing_schema=schema,
+            registry=validator._registry,
+            resolver=validator._resolver,
+        )
+    else:
+        index = None
+
+    if index is not None and isinstance(instance, dict):
+        if index.property not in instance:
+            # The discriminating property is required by every branch, so
+            # no branch can match; the generic path produces the accurate
+            # required-property errors and full context.
+            _discriminator._stats["fallbacks"] += 1
+            yield from _one_of_generic(validator, oneOf, instance)
+            return
+
+        candidates = index.candidates(instance)
+        if not candidates:
+            # The discriminating value matches no branch, so every branch
+            # is provably inapplicable.  Go straight to the exhaustive path
+            # for the precise errors without first re-validating anything,
+            # so failing requests pay no extra candidate work.
+            _discriminator._stats["fallbacks"] += 1
+            yield from _one_of_generic(validator, oneOf, instance)
+            return
+
+        valid = []
+        for index_ in candidates:
+            _discriminator._stats["branch_visits"] += 1
+            errs = list(
+                validator.descend(
+                    instance,
+                    oneOf[index_],
+                    schema_path=index_,
+                ),
+            )
+            if not errs:
+                valid.append(index_)
+
+        if len(valid) == 1:
+            # Every non-candidate branch is provably inapplicable, and
+            # exactly one candidate validates: this is the only branch
+            # the instance can be valid under.
+            _discriminator._stats["fast_path_success"] += 1
+            return
+
+        # Zero or multiple candidates validated.  Re-run exhaustively
+        # so that errors (including full per-branch context and the
+        # "valid under each of" ordering) are computed exactly as
+        # without indexing; no error detail is dropped for speed.
+        _discriminator._stats["fallbacks"] += 1
+        yield from _one_of_generic(validator, oneOf, instance)
+        return
+
+    # No usable index (unprovable discriminator, legacy resolver, or a
+    # non-object instance): validate exactly as before indexing existed.
+    yield from _one_of_generic(validator, oneOf, instance)
 
 
 def not_(validator, not_schema, instance, schema):

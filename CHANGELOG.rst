@@ -1,6 +1,11 @@
 v4.27.0
 =======
 
+* Add an optional candidate index for ``oneOf`` applicators whose branches all discriminate on the same required property via inline ``const`` or ``enum`` (e.g. tagged ``type`` messages).
+  When provably applicable, a successful request validates only the single matching branch instead of scanning every branch.
+  The optimization is conservative: optional properties, overlapping or non-constant constraints, ``true``/``1`` aliasing, boolean subschemas, and unresolvable or dynamic references are never pruned, and every other case keeps the exhaustive path with identical errors and ``unevaluatedProperties`` / ``unevaluatedItems`` annotations.
+  Cached indexes carry a structural freshness guard, so an in-place schema mutation rebuilds rather than reusing stale state.
+  Set ``JSONSCHEMA_DISABLE_DISCRIMINATOR_INDEX=1`` to turn it off.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
