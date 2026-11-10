@@ -17,12 +17,14 @@ import reprlib
 import warnings
 
 from attrs import define, field, fields
+from attrs import validators as _attrs_validators
 from jsonschema_specifications import REGISTRY as SPECIFICATIONS
 from rpds import HashTrieMap
 import referencing.exceptions
 import referencing.jsonschema
 
 from jsonschema import (
+    _direction,
     _format,
     _keywords,
     _legacy_keywords,
@@ -248,6 +250,14 @@ def create(
             default=None,
             kw_only=True,
             repr=False,
+        )
+        direction: str | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+            validator=_attrs_validators.optional(
+                _attrs_validators.in_(_direction.DIRECTIONS),
+            ),
         )
 
         def __init_subclass__(cls):
@@ -599,6 +609,154 @@ def extend(
         id_of=validator.ID_OF,
         applicable_validators=validator._APPLICABLE_VALIDATORS,
     )
+
+
+_DIRECTIONAL_PROFILES: dict[type[Validator], type[Validator]] = {}
+
+
+def directional_profile(cls: type[Validator]) -> type[Validator]:
+    """
+    Create a directional profile of the given validator class.
+
+    The returned class behaves exactly like ``cls``, except that
+    instances created with an explicit ``direction`` enforce the
+    ``readOnly`` / ``writeOnly`` annotations:
+
+    * ``direction="write"`` (client input): properties annotated
+      ``readOnly: true`` must not be present, and are not required
+    * ``direction="read"`` (server output): properties annotated
+      ``writeOnly: true`` must not be present, and are not required
+
+    Instances created without a ``direction`` validate exactly like the
+    standard validator class. Validation only reports errors and never
+    modifies the validated instance.
+
+    See `jsonschema._direction` for the full description of how
+    direction constraints interact with ``required``, nesting, ``$ref``
+    and conditional subschemas.
+
+    Arguments:
+
+        cls (jsonschema.protocols.Validator):
+
+            the validator class to derive the profile from
+
+    Returns:
+
+        a new `jsonschema.protocols.Validator` class
+
+    Examples:
+
+        >>> schema = {
+        ...     "type": "object",
+        ...     "properties": {
+        ...         "id": {"type": "integer", "readOnly": True},
+        ...         "password": {"type": "string", "writeOnly": True},
+        ...     },
+        ... }
+        >>> Profile = directional_profile(Draft202012Validator)
+        >>> request = Profile(schema, direction="write")
+        >>> request.is_valid({"password": "secret"})
+        True
+        >>> request.is_valid({"id": 1, "password": "secret"})
+        False
+        >>> response = request.evolve(direction="read")
+        >>> response.is_valid({"id": 1})
+        True
+        >>> response.is_valid({"id": 1, "password": "secret"})
+        False
+    """
+    try:
+        return _DIRECTIONAL_PROFILES[cls]
+    except KeyError:
+        profile = extend(
+            cls,
+            validators={
+                "properties": _direction.properties,
+                "required": _direction.required,
+            },
+        )
+        profile.__name__ = profile.__qualname__ = f"Directional{cls.__name__}"
+
+        def evolve(self, **changes):
+            # Like Validator.evolve, but re-derive the directional
+            # profile when the schema's $schema keyword points at the
+            # underlying dialect, so evolving (e.g. to switch direction
+            # or to descend) never silently drops the profile.
+            changes.setdefault("schema", self.schema)
+            NewValidator = validator_for(changes["schema"], default=profile)
+            if not getattr(NewValidator, "_IS_DIRECTIONAL_PROFILE", False):
+                NewValidator = directional_profile(NewValidator)
+            for each in fields(NewValidator):
+                if not each.init:
+                    continue
+                if each.alias not in changes:
+                    changes[each.alias] = getattr(self, each.name)
+            return NewValidator(**changes)
+
+        profile.evolve = evolve
+        profile._IS_DIRECTIONAL_PROFILE = True
+        _DIRECTIONAL_PROFILES[cls] = profile
+        return profile
+
+
+def directional_validator_for(
+    schema,
+    direction: str,
+    default: type[Validator] | _utils.Unset = _UNSET,
+) -> Validator:
+    """
+    Create a validator enforcing ``readOnly`` / ``writeOnly`` for a direction.
+
+    The appropriate validator class for the given schema is looked up
+    (as in `validator_for`), extended into a directional profile via
+    `directional_profile`, and instantiated with the given direction.
+
+    Arguments:
+
+        schema (collections.abc.Mapping or bool):
+
+            the schema to validate with
+
+        direction (str):
+
+            either ``"write"`` (validating client input, where
+            ``readOnly`` properties are forbidden) or ``"read"``
+            (validating server output, where ``writeOnly`` properties
+            are forbidden)
+
+        default:
+
+            the default validator class to use if the appropriate one
+            cannot be determined from the schema
+
+    Returns:
+
+        a `jsonschema.protocols.Validator` instance bound to the given
+        direction
+
+    Examples:
+
+        >>> schema = {
+        ...     "type": "object",
+        ...     "properties": {
+        ...         "id": {"type": "integer", "readOnly": True},
+        ...         "password": {"type": "string", "writeOnly": True},
+        ...     },
+        ... }
+        >>> validator = directional_validator_for(schema, direction="read")
+        >>> validator.is_valid({"id": 1})
+        True
+        >>> validator.is_valid({"id": 1, "password": "secret"})
+        False
+    """
+    if direction not in _direction.DIRECTIONS:
+        raise ValueError(
+            f"direction must be one of {_direction.DIRECTIONS!r}, "
+            f"got {direction!r}",
+        )
+    cls = validator_for(schema, default=default)
+    return directional_profile(cls)(schema=schema, direction=direction)
 
 
 Draft3Validator = create(

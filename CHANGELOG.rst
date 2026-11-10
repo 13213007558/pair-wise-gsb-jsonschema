@@ -1,3 +1,10 @@
+Unreleased
+==========
+
+* Add directional (read/write) validation profiles via ``jsonschema.validators.directional_profile`` and ``jsonschema.validators.directional_validator_for``.
+  A single schema can now validate both client input (``direction="write"``, where ``readOnly`` properties are rejected) and server output (``direction="read"``, where ``writeOnly`` properties are rejected), with ``required`` only applying to properties allowed in the current direction.
+  Standard validators are unchanged and continue to ignore the ``readOnly`` / ``writeOnly`` annotations.
+
 v4.27.0
 =======
 

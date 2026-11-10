@@ -11,6 +11,7 @@ Contents
     :maxdepth: 2
 
     validate
+    direction
     errors
     referencing
     creating

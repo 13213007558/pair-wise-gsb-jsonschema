@@ -112,6 +112,11 @@ class Validator(Protocol):
     #: The schema that will be used to validate instances
     schema: Mapping | bool
 
+    #: The direction (``"read"`` or ``"write"``) enforced by this
+    #: validator, or `None` for standard, non-directional validation.
+    #: See `jsonschema.validators.directional_profile`.
+    direction: str | None
+
     def __init__(
         self,
         schema: Mapping | bool,
@@ -119,6 +124,7 @@ class Validator(Protocol):
         format_checker: jsonschema.FormatChecker | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
+        direction: str | None = None,
     ) -> None: ...
 
     @classmethod
