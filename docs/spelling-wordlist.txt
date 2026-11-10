@@ -27,6 +27,16 @@ iteratively
 Javascript
 jsonschema
 majorly
+bespoke
+callable
+cyclic
+dialect
+dialects
+enumerable
+memoize
+memoized
+memoizes
+memoization
 metaschema
 online
 outputter

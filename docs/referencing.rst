@@ -383,6 +383,218 @@ E.g. in pseudocode:
     registry = Registry(retrieve=retrieve)
 
 
+A Full Side-by-Side Migration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The snippets above each move over a single feature.
+Real applications usually combine a local ``store`` *and* a custom URI handler, and rely on dialect-specific behavior, so the remainder of this section walks through one complete, executable migration that keeps all of them in view.
+
+The example schema is a small tree of documents: a root resource that refers to a nested resource identified by a relative :kw:`$id`, which in turn refers back to the root, forming a cycle.
+We validate the same instances before and after the migration and compare the result, the error paths and the number of times a resource is fetched.
+
+The first thing to get right is the `referencing.Specification`.
+Each resource is explicitly pinned to the dialect it was written for so that an old schema is never silently re-interpreted under a newer one.
+
+.. testcode::
+
+    from referencing import Registry
+    from referencing.exceptions import NoSuchResource
+    from referencing.jsonschema import DRAFT202012
+
+    root_uri = "https://example.com/app/tree/"
+    child_uri = root_uri + "child"
+
+    child = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "child",  # a *relative* $id, resolved against root_uri
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "parent": {"$ref": root_uri},  # circular reference back to root
+        },
+        "required": ["name"],
+    }
+    root = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": root_uri,
+        "type": "object",
+        "properties": {
+            # The same-document ref is listed first so the legacy resolver's
+            # mutable scope stack does not affect the example below.
+            "count": {"$ref": "#/$defs/int", "minimum": 5},
+            "label": {"type": "string"},
+            "child": {"$ref": "child"},
+        },
+        "$defs": {"int": {"type": "integer"}},
+    }
+
+Here is the **original** configuration.
+The local documents live in the ``store`` and the ``handlers`` mapping knows how to fetch a custom scheme:
+
+.. testcode::
+
+    from jsonschema import Draft202012Validator, RefResolver
+
+    def legacy_handler(uri):  # pragma: no cover
+        # Only invoked for URIs that are not already present in the store.
+        raise AssertionError("the store should satisfy every reference")
+
+    legacy_resolver = RefResolver.from_schema(
+        root,
+        store={child_uri: child},
+        handlers={"custom": legacy_handler},
+    )
+    legacy = Draft202012Validator(root, resolver=legacy_resolver)
+
+The **migrated** configuration moves the store into in-memory resources and adapts the handler into a single ``retrieve`` callable.
+The retriever raises `referencing.exceptions.NoSuchResource` for anything the application did not provide instead of falling back to a download:
+
+.. testcode::
+
+    def retrieve(uri):
+        # This application ships every schema it needs, so an unknown URI is
+        # a configuration error, not an invitation to fetch it over network.
+        raise NoSuchResource(ref=uri)
+
+    registry = Registry(retrieve=retrieve).with_resources(
+        [
+            (root_uri, DRAFT202012.create_resource(root)),
+            (child_uri, DRAFT202012.create_resource(child)),
+        ],
+    )
+    migrated = Draft202012Validator(root, registry=registry)
+
+Both validators accept the same valid, cyclic instance and reject the same invalid instances with the same paths:
+
+.. testcode::
+
+    valid_instance = {
+        "label": "root",
+        "count": 7,
+        "child": {"name": "kid", "parent": {"label": "deep"}},
+    }
+    assert migrated.is_valid(valid_instance)
+    assert legacy.is_valid(valid_instance)
+
+    missing_name = {"child": {"parent": {}}}
+    error = next(migrated.iter_errors(missing_name))
+    assert list(error.absolute_path) == ["child"]
+    assert error.message == "'name' is a required property"
+    assert list(error.absolute_schema_path) == [
+        "properties", "child", "required",
+    ]
+
+    # The adjacent minimum: 5 is enforced on this dialect.
+    assert not migrated.is_valid({"count": 2})
+
+Because the nested documents are preloaded, the retriever is never called, so the number of resource fetches stays at zero -- the same guarantee the populated ``store`` gave:
+
+.. testcode::
+
+    fetched = []
+
+    def counting_retrieve(uri):
+        fetched.append(uri)
+        raise NoSuchResource(ref=uri)
+
+    offline_registry = Registry(retrieve=counting_retrieve).with_resources(
+        [
+            (root_uri, DRAFT202012.create_resource(root)),
+            (child_uri, DRAFT202012.create_resource(child)),
+        ],
+    )
+    Draft202012Validator(root, registry=offline_registry).validate(valid_instance)
+    assert fetched == []
+
+A URI the application never registered now fails loudly and locally, with the offending URI attached, rather than triggering a network request:
+
+.. testcode::
+
+    import referencing.exceptions
+    from jsonschema import exceptions
+
+    unknown = "https://example.com/not-shipped"
+    resolver_only = Draft202012Validator(
+        {"$ref": unknown},
+        registry=Registry(retrieve=counting_retrieve),
+    )
+    try:
+        resolver_only.validate({})
+    except exceptions._WrappedReferencingError as wrapped:
+        underlying = wrapped.args[0]
+    assert isinstance(underlying, referencing.exceptions.Unresolvable)
+    assert underlying.ref == unknown
+    assert fetched == [unknown]  # consulted once, then refused; never downloaded
+
+Adapting a handler that genuinely fetches
+'''''''''''''''''''''''''''''''''''''''''
+
+If your handler really does retrieve a document (from a database, object storage, a bespoke protocol...), move that logic into the ``retrieve`` callable and return a `referencing.Resource`.
+Note that, unlike `_RefResolver`, a plain `referencing.Registry` does not memoize calls to ``retrieve``.
+To keep the old "fetch each URI at most once" behavior, wrap the retriever with `referencing.retrieval.to_cached_resource`, which adds an :func:`functools.lru_cache`:
+
+.. testcode::
+
+    import json
+
+    import referencing.retrieval
+
+    remote_documents = {
+        "custom://service/positive": json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "integer",
+                "minimum": 0,
+            },
+        ),
+    }
+    fetch_count = []
+
+    @referencing.retrieval.to_cached_resource()
+    def custom_retrieve(uri):
+        fetch_count.append(uri)
+        try:
+            return remote_documents[uri]
+        except KeyError:
+            raise NoSuchResource(ref=uri) from None
+
+    cached_registry = Registry(retrieve=custom_retrieve)
+    for _ in range(3):
+        Draft202012Validator(
+            {"$ref": "custom://service/positive"},
+            registry=cached_registry,
+        ).validate(5)
+    assert fetch_count == ["custom://service/positive"]  # fetched only once
+
+Knowing which resources ship with the application
+'''''''''''''''''''''''''''''''''''''''''''''''''
+
+A `referencing.Registry` is enumerable, so after migrating you can ask exactly which resources are bundled rather than implicitly downloaded.
+Nested resources discovered by crawling relative :kw:`$id` values are included:
+
+.. testcode::
+
+    shipped = Registry().with_resources(
+        [
+            (root_uri, DRAFT202012.create_resource(root)),
+            (child_uri, DRAFT202012.create_resource(child)),
+        ],
+    )
+    assert set(shipped.crawl().keys()) == {root_uri, child_uri}
+    assert child_uri in shipped.crawl()
+
+Dialect-specific behavior to preserve
+'''''''''''''''''''''''''''''''''''''
+
+Two differences across drafts are easy to get wrong during a migration:
+
+* Draft 4 identifies resources with the bare ``id`` keyword (not :kw:`$id`) and **ignores** any keyword adjacent to a :kw:`$ref`. Pin such a resource with ``referencing.jsonschema.DRAFT4.create_resource(...)`` so the sibling keyword stays ignored.
+* Draft 2019-09 and 2020-12 use :kw:`$id` and **do** evaluate keywords adjacent to a :kw:`$ref`. The earlier ``"count": {"$ref": ..., "minimum": 5}`` example relies on this.
+
+Choosing the correct `referencing.Specification` per resource is what prevents an old schema from being silently read under the newest dialect.
+A regression test covering all three dialects lives alongside the rest of the test suite in ``jsonschema/tests/test_refresolver_migration.py`` and compares validation results, error paths and fetch counts between the legacy and migrated configurations.
+
+
 Other Key Functional Differences
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
