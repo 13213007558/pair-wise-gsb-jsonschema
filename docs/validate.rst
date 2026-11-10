@@ -219,6 +219,90 @@ The more specific list of formats along with any additional dependencies they ha
 
     If a dependency is not installed when using a checker that requires it, validation will succeed without throwing an error, as also specified by the specification.
 
+.. _strict-format-checking:
+
+Strict Format Checking
+~~~~~~~~~~~~~~~~~~~~~~
+
+The lenient behavior above is convenient but can silently leave a
+:kw:`format` assertion unenforced when an optional dependency is missing or
+when a schema references a format the library does not know about.
+
+Pass ``strict_format=True`` when constructing a `Validator` to opt into
+*strict* format checking. While the validator is being prepared, the whole
+schema is walked — including :kw:`$defs`, the combinator keywords
+(:kw:`allOf`, :kw:`anyOf`, :kw:`oneOf`, :kw:`not` and friends) and any
+references resolved through the supplied registry — to find every genuinely
+declared :kw:`format` keyword. A string named ``"format"`` that merely appears
+inside :kw:`const` or :kw:`enum` data is ordinary instance data and is not
+treated as a declaration.
+
+Each declared format must have a usable checker, otherwise preparation raises
+`jsonschema.exceptions.StrictFormatError` *before any instance is validated*.
+Three situations are distinguished by the error's ``reason`` attribute:
+
+* ``"unknown"`` — the format is not a format the library recognizes;
+* ``"missing-dependency"`` — the format is recognized, but the optional
+  package that implements its checker is not installed (the package name is
+  available on the error as ``dependency``);
+* ``"annotation-only"`` — the format was explicitly listed as allowed to
+  remain a pure annotation.
+
+.. testcode::
+
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import StrictFormatError
+
+    schema = {"type": "string", "format": "ipv4"}
+    validator = Draft202012Validator(schema, strict_format=True)
+    validator.validate("127.0.0.1")  # succeeds
+    validator.validate("not-an-ip")  # raises ValidationError
+
+Known formats whose checkers you deliberately do not want to enforce can be
+named via ``annotation_only_formats``. Such a format then behaves as a plain
+annotation even if its checker is unavailable:
+
+.. testcode::
+
+    validator = Draft202012Validator(
+        {"format": "uri"},
+        strict_format=True,
+        annotation_only_formats=frozenset({"uri"}),
+    )
+
+A custom checker registered on a `FormatChecker` counts as a usable checker,
+so strict mode also works for formats the library has no built-in knowledge
+of:
+
+.. testcode::
+
+    from jsonschema import FormatChecker
+
+    checker = FormatChecker(formats=())
+    checker.checks("my-format")(lambda instance: instance == "allowed")
+    validator = Draft202012Validator(
+        {"format": "my-format"},
+        format_checker=checker,
+        strict_format=True,
+    )
+
+Once prepared, the set of enforced checkers is *frozen*. Registering another
+checker with the same name elsewhere afterwards cannot change how an existing
+strict validator behaves, and attempting to register on the frozen checker
+raises `jsonschema.exceptions.FrozenFormatCheckerError`.
+
+Strict mode is opt-in: validators constructed without ``strict_format=True``
+keep the historical, lenient behavior in which unknown or uncheckable formats
+are ignored.
+
+.. autoexception:: jsonschema.exceptions.StrictFormatError
+    :noindex:
+    :members:
+
+.. autoexception:: jsonschema.exceptions.FrozenFormatCheckerError
+    :noindex:
+    :members:
+
 =========================  ====================
 Checker                    Notes
 =========================  ====================

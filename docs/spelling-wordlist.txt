@@ -17,6 +17,10 @@ deserialize
 deserialized
 deserializing
 filesystem
+FormatChecker
+FrozenFormatCheckerError
+StrictFormatError
+frozen
 hostname
 implementers
 indices

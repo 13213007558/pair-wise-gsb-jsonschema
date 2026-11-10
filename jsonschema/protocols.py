@@ -82,6 +82,24 @@ class Validator(Protocol):
             its `extra (optional) dependencies <index:extras>` when
             invoking ``pip``.
 
+        strict_format:
+
+            keyword-only. When true, the checker is prepared in strict mode
+            while the validator is constructed: every :kw:`format` declared
+            in the schema (including across :kw:`$defs`, combinator
+            keywords and registry references) must have a usable checker, or
+            `jsonschema.exceptions.StrictFormatError` is raised before any
+            instance is validated. The prepared checker is then frozen so
+            later registrations cannot change this validator. Defaults to
+            false, which preserves the lenient, annotation-only behavior.
+
+        annotation_only_formats:
+
+            keyword-only. A set of known format names that strict mode may
+            leave as pure annotations rather than enforce, even when their
+            optional checker dependency is unavailable. Ignored unless
+            ``strict_format`` is true.
+
     .. deprecated:: v4.12.0
 
         Subclassing validator classes now explicitly warns this is not part of
@@ -119,6 +137,8 @@ class Validator(Protocol):
         format_checker: jsonschema.FormatChecker | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
+        strict_format: bool = False,
+        annotation_only_formats: frozenset[str] = frozenset(),
     ) -> None: ...
 
     @classmethod

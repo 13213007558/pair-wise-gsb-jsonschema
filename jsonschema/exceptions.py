@@ -333,6 +333,100 @@ class FormatError(Exception):
         return self.message
 
 
+class FrozenFormatCheckerError(RuntimeError):
+    """
+    A frozen `jsonschema.FormatChecker` was asked to register a new format.
+
+    Checkers prepared for a strict validator are frozen so that later
+    registrations cannot change the behavior of an existing validator.
+    """
+
+
+class StrictFormatError(Exception):
+    """
+    A strict format checker could not be prepared for a schema.
+
+    Raised while preparing a strict `jsonschema.FormatChecker`, when a
+    :kw:`format` keyword declared somewhere in the schema does not have a
+    usable checker. Three distinct situations are distinguished via the
+    :attr:`reason` attribute:
+
+    * ``"unknown"``: the format is not one of the formats this library
+      knows about at all, so no checker can ever be registered for it
+      automatically;
+    * ``"missing-dependency"``: the format is a known one, but the optional
+      package which implements its checker is not installed;
+    * ``"annotation-only"``: the format was explicitly listed as allowed to
+      remain a pure annotation instead of being enforced; this state is
+      represented by a constant and is normally an allowed configuration
+      rather than a raised error.
+
+    Attributes:
+
+        format:
+            the name of the :kw:`format` keyword that could not be checked
+
+        reason:
+            one of ``"unknown"``, ``"missing-dependency"`` or
+            ``"annotation-only"``
+
+        schema_path:
+            the location within the schema (including any referenced
+            documents) where the :kw:`format` keyword was declared, as a
+            sequence of object property names and array indices
+
+        dependency:
+            the name of the missing optional package, when :attr:`reason`
+            is ``"missing-dependency"``, otherwise ``None``
+    """
+
+    UNKNOWN = "unknown"
+    MISSING_DEPENDENCY = "missing-dependency"
+    ANNOTATION_ONLY = "annotation-only"
+
+    def __init__(self, format, reason, schema_path=(), *, dependency=None):
+        self.format = format
+        self.reason = reason
+        self.schema_path = deque(schema_path)
+        self.dependency = dependency
+        super().__init__(self._message())
+
+    def _message(self):
+        path = "".join(
+            f"[{part!r}]" if isinstance(part, str) else f"[{part}]"
+            for part in self.schema_path
+        ) or "<root>"
+        location = f"at schema path {path}"
+        if self.reason == self.UNKNOWN:
+            detail = (
+                f"the format {self.format!r} is not a known format, so no "
+                "checker is available for it"
+            )
+        elif self.reason == self.MISSING_DEPENDENCY:
+            if self.dependency:
+                detail = (
+                    f"the known format {self.format!r} requires the optional "
+                    f"package {self.dependency!r}, which is not installed. "
+                    f"Install {self.dependency!r} to enable it."
+                )
+            else:
+                detail = (
+                    f"the known format {self.format!r} requires an optional "
+                    "package which is not installed."
+                )
+        else:
+            detail = (
+                f"the format {self.format!r} was explicitly configured as "
+                "annotation-only and cannot be enforced"
+            )
+        return (
+            f"Unable to prepare a strict format checker {location}: {detail}"
+        )
+
+    def __str__(self):
+        return self.args[0]
+
+
 class ErrorTree:
     """
     ErrorTrees make it easier to check which validations failed.

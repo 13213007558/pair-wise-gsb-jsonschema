@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import date, datetime
 from uuid import UUID
@@ -9,13 +9,93 @@ import re
 import string
 import warnings
 
-from jsonschema.exceptions import FormatError
+from jsonschema.exceptions import (
+    FormatError,
+    FrozenFormatCheckerError,
+    StrictFormatError,
+)
 
 #: A format checker callable.
 _FormatCheckCallable = Callable[[object], bool]
 _RaisesType = type[Exception] | tuple[type[Exception], ...]
 
 _RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
+
+#: The formats recognized by JSON Schema drafts which rely on an optional
+#: third-party package, mapped to the package(s) which provide their checker.
+#:
+#: A value lists the packages that can supply the checker; a format is
+#: considered available if any of them is installed. Formats implemented using
+#: only the standard library are deliberately absent and are always available.
+_FORMAT_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "color": ("webcolors",),
+    "date-time": ("rfc3339_validator",),
+    "time": ("rfc3339_validator",),
+    "duration": ("isoduration",),
+    "hostname": ("fqdn",),
+    "host-name": ("fqdn",),
+    "idn-hostname": ("idna",),
+    "iri": ("rfc3987", "rfc3987_syntax"),
+    "iri-reference": ("rfc3987", "rfc3987_syntax"),
+    "json-pointer": ("jsonpointer",),
+    "relative-json-pointer": ("jsonpointer",),
+    "uri": ("rfc3987", "rfc3986_validator"),
+    "uri-reference": ("rfc3987", "rfc3986_validator"),
+    "uri-template": ("uri_template",),
+}
+
+#: Every format name defined across the supported JSON Schema drafts.
+#: Standard-library-only formats are included alongside the optional ones
+#: above so that a declared format can be classified as either a known (but
+#: possibly uninstalled) format or a genuinely unknown one.
+_KNOWN_FORMATS: frozenset[str] = frozenset(
+    {
+        "color",
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "host-name",
+        "idn-email",
+        "idn-hostname",
+        "ip-address",
+        "ipv4",
+        "ipv6",
+        "iri",
+        "iri-reference",
+        "json-pointer",
+        "regex",
+        "relative-json-pointer",
+        "time",
+        "uri",
+        "uri-reference",
+        "uri-template",
+        "uuid",
+    },
+)
+
+
+def _is_installed(package: str) -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec(package) is not None
+
+
+def missing_dependency(format: str) -> str | None:
+    """
+    Return the name of a missing optional package for the given known format.
+
+    Returns ``None`` if the format needs no optional package, or if one of the
+    packages that can supply its checker is already installed.
+    """
+    packages = _FORMAT_DEPENDENCIES.get(format)
+    if not packages:
+        return None
+    for package in packages:
+        if _is_installed(package):
+            return None
+    return packages[0]
 
 
 class FormatChecker:
@@ -50,6 +130,7 @@ class FormatChecker:
         if formats is None:
             formats = self.checkers.keys()
         self.checkers = {k: self.checkers[k] for k in formats}
+        self._frozen = False
 
     def __repr__(self):
         return f"<FormatChecker checkers={sorted(self.checkers)}>"
@@ -80,10 +161,124 @@ class FormatChecker:
         """
 
         def _checks(func: F) -> F:
+            if self._frozen:
+                raise FrozenFormatCheckerError(
+                    f"Cannot register format {format!r}: this FormatChecker "
+                    "is frozen and its set of checkers cannot change.",
+                )
             self.checkers[format] = (func, raises)
             return func
 
         return _checks
+
+    def freeze(self) -> FormatChecker:
+        """
+        Mark this checker as frozen, returning the checker itself.
+
+        A frozen checker rejects further `checks` registrations. Freezing the
+        checker prepared for a strict validator pins the exact set of formats
+        that validator will enforce, independent of later global registrations.
+        """
+        self._frozen = True
+        return self
+
+    @property
+    def frozen(self) -> bool:
+        """Whether this checker no longer accepts new registrations."""
+        return self._frozen
+
+    def strict_for(
+        self,
+        schema,
+        resolver,
+        applicable_validators,
+        *,
+        annotation_only: Iterable[str] = (),
+    ) -> FormatChecker:
+        """
+        Prepare a frozen checker covering every format the schema declares.
+
+        The schema is walked following ``$ref`` (and related) keywords through
+        the supplied ``resolver`` so that references into the local registry
+        are inspected as well.
+
+        Every genuinely declared :kw:`format` keyword must have a usable
+        checker, otherwise `jsonschema.exceptions.StrictFormatError` is raised
+        while preparing the validator rather than being silently ignored.
+
+        A new frozen checker is returned; the checker this method is called on
+        is left untouched, so it can keep serving other validators. Checkers
+        already registered on this instance (including user-defined formats)
+        are carried over and count as available.
+
+        Arguments:
+
+            schema:
+
+                the root schema whose formats will be enforced
+
+            resolver:
+
+                a ``referencing`` resolver rooted at ``schema``, used to
+                resolve references into the local registry
+
+            applicable_validators:
+
+                the validator class' ``applicable_validators`` callable, used
+                to honor draft-specific rules such as ignoring the siblings of
+                a ``$ref`` keyword
+
+            annotation_only:
+
+                known formats that are allowed to remain mere annotations; a
+                declaration of one of these does not require a checker and no
+                error is raised for it
+
+        """
+        annotation_only = frozenset(annotation_only)
+        declared = _find_declared_formats(
+            schema=schema,
+            resolver=resolver,
+            applicable_validators=applicable_validators,
+        )
+
+        for format, paths in declared.items():
+            # A checker already registered on this FormatChecker (including a
+            # user-defined one) is always usable.
+            if format in self.checkers:
+                continue
+            dependency = missing_dependency(format)
+            if dependency is not None:
+                if format in annotation_only:
+                    # A known format explicitly allowed to remain a mere
+                    # annotation does not require its (missing) checker.
+                    continue
+                raise StrictFormatError(
+                    format,
+                    StrictFormatError.MISSING_DEPENDENCY,
+                    schema_path=paths[0],
+                    dependency=dependency,
+                )
+            if format not in _KNOWN_FORMATS:
+                # Annotation-only only makes sense for a known format; an
+                # unrecognized name is always a configuration error.
+                raise StrictFormatError(
+                    format,
+                    StrictFormatError.UNKNOWN,
+                    schema_path=paths[0],
+                )
+
+        # Pin exactly the enforced formats on a separate frozen checker.
+        # Annotation-only formats and any format the schema never declares are
+        # intentionally left out, and later registrations elsewhere cannot
+        # affect the result.
+        prepared = type(self)(formats=())
+        prepared.checkers = {
+            format: self.checkers[format]
+            for format in declared
+            if format in self.checkers and format not in annotation_only
+        }
+        return prepared.freeze()
 
     @classmethod
     def cls_checks[F: _FormatCheckCallable](
@@ -172,6 +367,134 @@ class FormatChecker:
             return False
         else:
             return True
+
+
+#: Applicator keywords whose value is a single (possibly boolean) subschema.
+_SINGLE_SUBSCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "not",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    },
+)
+
+#: Applicator keywords whose value is an array of subschemas.
+_ARRAY_SUBSCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {"allOf", "anyOf", "oneOf", "prefixItems"},
+)
+
+#: Applicator keywords whose value maps names to subschemas.
+_OBJECT_SUBSCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependencies",
+        "dependentSchemas",
+        "properties",
+        "patternProperties",
+    },
+)
+
+#: Applicator keywords whose value is either a single subschema or an array
+#: of subschemas (draft 3 ``extends`` and the older tuple ``items`` form).
+_ITEMS_KEYWORDS: frozenset[str] = frozenset({"items", "extends"})
+
+#: Reference keywords whose value is a URI reference to another schema.
+_REFERENCE_KEYWORDS: frozenset[str] = frozenset(
+    {"$ref", "$recursiveRef", "$dynamicRef"},
+)
+
+
+def _find_declared_formats(
+    schema,
+    resolver,
+    applicable_validators,
+) -> dict[str, list[tuple]]:
+    """
+    Walk the schema and collect every genuinely declared :kw:`format`.
+
+    Returns a mapping from format name to the schema paths (each a tuple of
+    property names and array indices) where that format was declared. A
+    ``format`` value that merely appears inside a :kw:`const` or :kw:`enum`
+    keyword is treated as ordinary instance data and is not collected.
+
+    References are followed through ``resolver`` (including references into
+    the local registry), and already-visited schema objects are tracked by
+    identity so that cyclic references cannot cause unbounded recursion.
+    """
+    import referencing.exceptions
+
+    declared: dict[str, list[tuple]] = {}
+    seen: set[int] = set()
+    pending: list[tuple[object, tuple, object]] = [(schema, (), resolver)]
+
+    while pending:
+        current, path, current_resolver = pending.pop()
+        if not isinstance(current, Mapping) or id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        for keyword, value in applicable_validators(current):
+            keyword_path = path + (keyword,)
+
+            if keyword == "format":
+                # Only a genuine `format` keyword that survives the draft's
+                # applicable-keyword rules counts. A string value named
+                # `format` nested inside `const`/`enum` data never reaches
+                # here.
+                if isinstance(value, str):
+                    declared.setdefault(value, []).append(keyword_path)
+            elif keyword in _REFERENCE_KEYWORDS:
+                if not isinstance(value, str):
+                    continue
+                try:
+                    resolved = current_resolver.lookup(value)
+                except referencing.exceptions.Unresolvable:
+                    # An unresolvable reference is reported (if at all) while
+                    # validating instances, not while preparing a checker.
+                    continue
+                pending.append(
+                    (resolved.contents, keyword_path, resolved.resolver),
+                )
+            elif keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
+                pending.append((value, keyword_path, current_resolver))
+            elif (
+                keyword in _ARRAY_SUBSCHEMA_KEYWORDS
+                or keyword in _ITEMS_KEYWORDS
+            ):
+                if isinstance(value, Mapping):
+                    pending.append((value, keyword_path, current_resolver))
+                elif (
+                    isinstance(value, Sequence)
+                    and not isinstance(value, str)
+                ):
+                    for index, subschema in enumerate(value):
+                        pending.append(
+                            (
+                                subschema,
+                                keyword_path + (index,),
+                                current_resolver,
+                            ),
+                        )
+            elif (
+                keyword in _OBJECT_SUBSCHEMA_KEYWORDS
+                and isinstance(value, Mapping)
+            ):
+                for name, subschema in value.items():
+                    pending.append(
+                        (
+                            subschema,
+                            keyword_path + (name,),
+                            current_resolver,
+                        ),
+                    )
+
+    return declared
 
 
 draft3_format_checker = FormatChecker()

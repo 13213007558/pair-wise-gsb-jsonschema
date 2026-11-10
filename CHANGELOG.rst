@@ -1,6 +1,9 @@
 v4.27.0
 =======
 
+* Add opt-in strict format checking via a new ``strict_format`` validator argument.
+  When enabled, preparing a validator walks the schema (including ``$defs``, combinator keywords and local registry references) and raises `jsonschema.exceptions.StrictFormatError` if any genuinely declared ``format`` lacks a usable checker, distinguishing unknown formats, known formats whose optional dependency is missing, and formats explicitly allowed as annotation-only via ``annotation_only_formats``.
+  The prepared checker is frozen, so later format registrations cannot change an existing validator; the default lenient behavior is unchanged.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

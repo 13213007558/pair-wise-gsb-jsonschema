@@ -237,6 +237,20 @@ def create(
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
         _ref_resolver = field(default=None, repr=False, alias="resolver")
         format_checker: _format.FormatChecker | None = field(default=None)
+        strict_format: bool = field(default=False, kw_only=True, repr=False)
+        annotation_only_formats: frozenset[str] = field(
+            default=frozenset(),
+            kw_only=True,
+            repr=False,
+        )
+        # The (non-pinned) checker strict preparation was based on, retained so
+        # evolving to another schema can re-prepare from the full checker set.
+        _strict_base_checker: _format.FormatChecker | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
         # TODO: include new meta-schemas added at runtime
         _registry: referencing.jsonschema.SchemaRegistry = field(
             default=_REMOTE_WARNING_REGISTRY,
@@ -289,6 +303,24 @@ def create(
                     registry = SPECIFICATIONS.combine(registry)
                 resource = specification.create_resource(self.schema)
                 self._resolver = registry.resolver_with_root(resource)
+
+            if self.strict_format:
+                base_checker = (
+                    self._strict_base_checker
+                    if self._strict_base_checker is not None
+                    else (
+                        self.format_checker
+                        if self.format_checker is not None
+                        else format_checker_arg
+                    )
+                )
+                self._strict_base_checker = base_checker
+                self.format_checker = base_checker.strict_for(
+                    schema=self.schema,
+                    resolver=self._resolver,
+                    applicable_validators=applicable_validators,
+                    annotation_only=self.annotation_only_formats,
+                )
 
             if self.schema is True or self.schema is False:
                 self._validators = []
