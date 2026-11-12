@@ -72,7 +72,22 @@ def format_as_index(container, indices):
     return f"{container}[{']['.join(repr(index) for index in indices)}]"
 
 
-def find_additional_properties(instance, schema):
+def regex_search(validator, pattern, string):
+    """
+    Run a schema regex through the validator's executor if one is set.
+
+    Without an executor the behavior is exactly ``re.search``; with one,
+    the executor decides how the search is bounded and any
+    `jsonschema._regex.RegexError` propagates rather than being treated
+    as a non-match, so the rejection boundary is never skipped.
+    """
+    executor = getattr(validator, "regex_executor", None)
+    if executor is None:
+        return bool(re.search(pattern, string))
+    return executor.search(pattern, string)
+
+
+def find_additional_properties(validator, instance, schema):
     """
     Return the set of additional properties for the given ``instance``.
 
@@ -82,10 +97,13 @@ def find_additional_properties(instance, schema):
     Assumes ``instance`` is dict-like already.
     """
     properties = schema.get("properties", {})
-    patterns = "|".join(schema.get("patternProperties", {}))
+    patterns = schema.get("patternProperties", {})
     for property in instance:
         if property not in properties:
-            if patterns and re.search(patterns, property):
+            if any(
+                regex_search(validator, pattern, property)
+                for pattern in patterns
+            ):
                 continue
             yield property
 
@@ -377,7 +395,7 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
     if "patternProperties" in schema:
         for property in instance:
             for pattern in schema["patternProperties"]:
-                if re.search(pattern, property):
+                if regex_search(validator, pattern, property):
                     evaluated_keys.append(property)
 
     if "dependentSchemas" in schema:

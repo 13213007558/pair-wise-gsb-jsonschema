@@ -12,6 +12,15 @@ for you.
 import warnings
 
 from jsonschema._format import FormatChecker
+from jsonschema._regex import (
+    BoundedRegexExecutor,
+    RegexBudget,
+    RegexError,
+    RegexExecutor,
+    RegexExecutorError,
+    RegexSyntaxError,
+    RegexTimeout,
+)
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import (
@@ -113,6 +122,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "BoundedRegexExecutor",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -120,6 +130,12 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "RegexBudget",
+    "RegexError",
+    "RegexExecutor",
+    "RegexExecutorError",
+    "RegexSyntaxError",
+    "RegexTimeout",
     "SchemaError",
     "TypeChecker",
     "ValidationError",

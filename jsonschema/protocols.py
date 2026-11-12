@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
     import referencing.jsonschema
 
-    from jsonschema import _typing
+    from jsonschema import _regex, _typing
     from jsonschema.exceptions import ValidationError
     import jsonschema
     import jsonschema.validators
@@ -119,6 +119,7 @@ class Validator(Protocol):
         format_checker: jsonschema.FormatChecker | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
+        regex_executor: jsonschema._regex.RegexExecutor | None = None,
     ) -> None: ...
 
     @classmethod

@@ -34,7 +34,15 @@ pre
 programmatically
 pseudocode
 recurses
+backtracking
 regex
+RegexBudget
+RegexError
+RegexExecutor
+RegexExecutorError
+RegexSyntaxError
+RegexTimeout
+BoundedRegexExecutor
 repr
 runtime
 sandboxing

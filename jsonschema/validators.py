@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache
 from operator import methodcaller
+from threading import local as _thread_local
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 from warnings import warn
@@ -26,6 +27,7 @@ from jsonschema import (
     _format,
     _keywords,
     _legacy_keywords,
+    _regex,
     _types,
     _typing,
     _utils,
@@ -36,6 +38,22 @@ if TYPE_CHECKING:
     from jsonschema.protocols import Validator
 
 _UNSET = _utils.Unset()
+
+# Thread-local stack of instance-path segments accumulated while
+# descending into nested schemas. It is independent of any particular
+# validator instance, so it survives the `evolve` calls that create a
+# fresh validator for every subschema. Used only to annotate regex
+# failures with the absolute location of the offending keyword.
+_REGEX_LOCATION = _thread_local()
+
+
+def _regex_stack():
+    return getattr(_REGEX_LOCATION, "stack", ())
+
+
+def _set_regex_stack(stack):
+    _REGEX_LOCATION.stack = stack
+
 
 _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
@@ -249,6 +267,11 @@ def create(
             kw_only=True,
             repr=False,
         )
+        regex_executor: _regex.RegexExecutor | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -350,6 +373,17 @@ def create(
             return NewValidator(**changes)
 
         def iter_errors(self, instance, _schema=None):
+            # A fresh top-level validation never inherits location
+            # segments left behind by a previous, partially-consumed
+            # generator on this thread.
+            _set_regex_stack(())
+            if self.regex_executor is None:
+                yield from self._iter_errors(instance, _schema)
+            else:
+                with self.regex_executor.validation():
+                    yield from self._iter_errors(instance, _schema)
+
+        def _iter_errors(self, instance, _schema=None):
             if _schema is not None:
                 warnings.warn(
                     (
@@ -359,7 +393,7 @@ def create(
                         "iter_errors(...) instead."
                     ),
                     DeprecationWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
                 validators = [
                     (self.VALIDATORS[k], k, v)
@@ -382,19 +416,25 @@ def create(
                 return
 
             for validator, k, v in validators:
-                errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+                # Keyword functions are generators, so cover iterating
+                # their result as well as calling them in the try.
+                try:
+                    errors = validator(self, v, instance, _schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=_schema,
+                            type_checker=self.TYPE_CHECKER,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        yield error
+                except _regex.RegexError as error:
+                    error.annotate(k, _regex_stack())
+                    raise
 
         def descend(
             self,
@@ -427,28 +467,41 @@ def create(
                     )
                 evolved = self.evolve(schema=schema, _resolver=resolver)
 
-            for k, v in applicable_validators(schema):
-                validator = evolved.VALIDATORS.get(k)
-                if validator is None:
-                    continue
+            previous_stack = _regex_stack()
+            if path is not None:
+                _set_regex_stack(previous_stack + (path,))
+            try:
+                for k, v in applicable_validators(schema):
+                    validator = evolved.VALIDATORS.get(k)
+                    if validator is None:
+                        continue
 
-                errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+                    # Keyword functions are generators: a regex failure
+                    # can surface while *iterating* their result, not
+                    # only when calling them, so the try covers the loop.
+                    try:
+                        errors = validator(evolved, v, instance, schema) or ()
+                        for error in errors:
+                            # set details if not already set by the called fn
+                            error._set(
+                                validator=k,
+                                validator_value=v,
+                                instance=instance,
+                                schema=schema,
+                                type_checker=evolved.TYPE_CHECKER,
+                            )
+                            if k not in {"if", "$ref"}:
+                                error.schema_path.appendleft(k)
+                            if path is not None:
+                                error.path.appendleft(path)
+                            if schema_path is not None:
+                                error.schema_path.appendleft(schema_path)
+                            yield error
+                    except _regex.RegexError as error:
+                        error.annotate(k, _regex_stack())
+                        raise
+            finally:
+                _set_regex_stack(previous_stack)
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):

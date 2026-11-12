@@ -14,6 +14,7 @@ Contents
     errors
     referencing
     creating
+    regex
     faq
     api/index
 
